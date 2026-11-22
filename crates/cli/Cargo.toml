@@ -1,0 +1,13 @@
+[package]
+name = "scarlett"
+description = "Command-line front end: inspect and run PE32+ images"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+scarlett-pe.workspace = true
+scarlett-hle.workspace = true
+scarlett-loader.workspace = true
+log.workspace = true
+env_logger.workspace = true

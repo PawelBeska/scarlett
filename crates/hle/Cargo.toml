@@ -1,0 +1,10 @@
+[package]
+name = "scarlett-hle"
+description = "High-level emulation of guest imports: registry, thunk table, Win64 trampoline"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+scarlett-pe.workspace = true
+log.workspace = true

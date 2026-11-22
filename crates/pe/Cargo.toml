@@ -1,0 +1,13 @@
+[package]
+name = "scarlett-pe"
+description = "PE32+ (x86-64) image parser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+# Synthetic PE builder, used by tests across the workspace.
+builder = []
+
+[dev-dependencies]
+scarlett-pe = { path = ".", features = ["builder"] }

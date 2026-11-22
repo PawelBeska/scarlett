@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = ["crates/pe", "crates/hle", "crates/loader", "crates/cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.88"
+
+[workspace.dependencies]
+scarlett-pe = { path = "crates/pe" }
+scarlett-hle = { path = "crates/hle" }
+scarlett-loader = { path = "crates/loader" }
+log = "0.4"
+libc = "0.2"
+env_logger = "0.11"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Memory",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_LibraryLoader",
+] }
