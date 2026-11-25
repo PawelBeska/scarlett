@@ -1203,6 +1203,45 @@ pub mod global {
     pub const LOAD_USHORT: u16 = 10;
     pub const LOAD_SSHORT: u16 = 11;
 
+    /// Sub-dword stores and d16 loads (AMD's RDNA2 ISA specification):
+    /// stores write the low 8/16 bits of data (the `_d16_hi` forms the
+    /// high half's); d16 loads extend to 16 bits and write the low or
+    /// (`_hi`) high half of vdst, keeping the other half.
+    pub const STORE_BYTE: u16 = 0x18;
+    pub const STORE_BYTE_D16_HI: u16 = 0x19;
+    pub const STORE_SHORT: u16 = 0x1A;
+    pub const STORE_SHORT_D16_HI: u16 = 0x1B;
+    pub const LOAD_UBYTE_D16: u16 = 0x20;
+    pub const LOAD_UBYTE_D16_HI: u16 = 0x21;
+    pub const LOAD_SBYTE_D16: u16 = 0x22;
+    pub const LOAD_SBYTE_D16_HI: u16 = 0x23;
+    pub const LOAD_SHORT_D16: u16 = 0x24;
+    pub const LOAD_SHORT_D16_HI: u16 = 0x25;
+
+    /// (bytes, from the high half of data) of a sub-dword store.
+    pub fn store_sub(op: u16) -> Option<(u32, bool)> {
+        Some(match op {
+            STORE_BYTE => (1, false),
+            STORE_BYTE_D16_HI => (1, true),
+            STORE_SHORT => (2, false),
+            STORE_SHORT_D16_HI => (2, true),
+            _ => return None,
+        })
+    }
+
+    /// (bytes, sign-extended, into the high half) of a d16 load.
+    pub fn load_d16(op: u16) -> Option<(u32, bool, bool)> {
+        Some(match op {
+            LOAD_UBYTE_D16 => (1, false, false),
+            LOAD_UBYTE_D16_HI => (1, false, true),
+            LOAD_SBYTE_D16 => (1, true, false),
+            LOAD_SBYTE_D16_HI => (1, true, true),
+            LOAD_SHORT_D16 => (2, false, false),
+            LOAD_SHORT_D16_HI => (2, false, true),
+            _ => return None,
+        })
+    }
+
     /// (bytes, sign-extended) of a sub-dword load.
     pub fn sub_dword(op: u16) -> Option<(u32, bool)> {
         Some(match op {
@@ -2543,6 +2582,16 @@ impl Inst {
             (Format::Ds, ds::WRXCHG_RTN_B32) => "ds_wrxchg_rtn_b32",
             (Format::Ds, ds::CMPST_RTN_B32) => "ds_cmpst_rtn_b32",
             (Format::Flat, global::LOAD_UBYTE) => "global_load_ubyte",
+            (Format::Flat, global::STORE_BYTE) => "global_store_byte",
+            (Format::Flat, global::STORE_BYTE_D16_HI) => "global_store_byte_d16_hi",
+            (Format::Flat, global::STORE_SHORT) => "global_store_short",
+            (Format::Flat, global::STORE_SHORT_D16_HI) => "global_store_short_d16_hi",
+            (Format::Flat, global::LOAD_UBYTE_D16) => "global_load_ubyte_d16",
+            (Format::Flat, global::LOAD_UBYTE_D16_HI) => "global_load_ubyte_d16_hi",
+            (Format::Flat, global::LOAD_SBYTE_D16) => "global_load_sbyte_d16",
+            (Format::Flat, global::LOAD_SBYTE_D16_HI) => "global_load_sbyte_d16_hi",
+            (Format::Flat, global::LOAD_SHORT_D16) => "global_load_short_d16",
+            (Format::Flat, global::LOAD_SHORT_D16_HI) => "global_load_short_d16_hi",
             (Format::Flat, global::LOAD_SBYTE) => "global_load_sbyte",
             (Format::Flat, global::LOAD_USHORT) => "global_load_ushort",
             (Format::Flat, global::LOAD_SSHORT) => "global_load_sshort",

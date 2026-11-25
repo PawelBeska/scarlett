@@ -3573,6 +3573,60 @@ fn int16_from_amd_spec() {
     check_all(&code);
 }
 
+/// global_store_byte/short(_d16_hi) from lanes sharing dwords, and the
+/// d16 loads of the neighbours' bytes / halves into the low or high half.
+#[test]
+fn global_sub_dword_stores_and_d16_loads() {
+    let flat = |op: u16, vdst: u32, addr: u32, data: u32, offset: u32| {
+        [0xDC00_0000 | (op as u32) << 18 | 2 << 14 | offset, vdst << 24 | 2 << 16 | data << 8 | addr]
+    };
+    let table: Vec<u32> = (0..320u32).map(|k| k.wrapping_mul(0x9E37_79B9) ^ 0x8080_8080).collect();
+    let mut code = vec![];
+    code.extend(vop3e(vop3::V_MBCNT_LO_U32_B32, 7, [int(-1), int(0), 0]));
+    code.extend(vop3e(vop3::V_MBCNT_HI_U32_B32, 7, [int(-1), v(7), 0]));
+    code.push(vop2e(vop2::V_LSHLREV_B32, 6, int(1), 7)); // v6 = 2 lane
+    code.push(vop2e(vop2::V_XOR_B32, 5, int(3), 7)); // v5 = lane ^ 3
+    code.push(vop2e(vop2::V_XOR_B32, 4, int(2), 6)); // v4 = 2 (lane ^ 1)
+    code.extend([sop1e(sop1::S_MOV_B32, 2, LIT), GBASE as u32]);
+    code.extend([sop1e(sop1::S_MOV_B32, 3, LIT), (GBASE >> 32) as u32]);
+    code.extend(flat(global::STORE_BYTE, 0, 7, 0, 0));
+    code.extend(flat(global::STORE_BYTE_D16_HI, 0, 7, 1, 256));
+    code.extend(flat(global::STORE_SHORT, 0, 6, 2, 512));
+    code.extend(flat(global::STORE_SHORT_D16_HI, 0, 6, 3, 768));
+    code.extend(flat(global::LOAD_UBYTE_D16, 0, 5, 0, 0));
+    code.extend(flat(global::LOAD_UBYTE_D16_HI, 0, 5, 0, 256));
+    code.extend(flat(global::LOAD_SBYTE_D16_HI, 1, 5, 0, 0));
+    code.extend(flat(global::LOAD_SBYTE_D16, 1, 5, 0, 256)); // last: its sign must not reach D[31:16]
+    code.extend(flat(global::LOAD_SHORT_D16, 2, 4, 0, 512));
+    code.extend(flat(global::LOAD_SHORT_D16_HI, 3, 4, 0, 768));
+    code.push(ENDPGM);
+    for size in [WaveSize::W32, WaveSize::W64] {
+        for seed in 0..3 {
+            for sparse in [false, true] {
+                check_mem(&code, size, seed, sparse, Some((GBASE, &table)));
+            }
+        }
+    }
+    // refused: a short at an odd address, two lanes storing one byte
+    let mut memory = SparseMemory::new();
+    memory.map(GBASE, 4 * table.len() as u64);
+    let mut w = Wave::new(WaveSize::W32, NV as usize);
+    w.exec = 3;
+    w.sgpr[2] = GBASE as u32;
+    w.sgpr[3] = (GBASE >> 32) as u32;
+    w.vgpr[7][0] = 1;
+    let mut c = flat(global::STORE_SHORT, 0, 7, 0, 0).to_vec();
+    c.push(ENDPGM);
+    assert!(interp::run_with_memory(&c, &mut w, &mut memory, 10).is_err());
+    let mut w = Wave::new(WaveSize::W32, NV as usize);
+    w.exec = 3;
+    w.sgpr[2] = GBASE as u32;
+    w.sgpr[3] = (GBASE >> 32) as u32;
+    let mut c = flat(global::STORE_BYTE, 0, 7, 0, 0).to_vec();
+    c.push(ENDPGM);
+    assert!(interp::run_with_memory(&c, &mut w, &mut memory, 10).is_err());
+}
+
 /// s_bitreplicate_b64_b32 into SGPRs, VCC and EXEC (a lane mask built
 /// from its half, as ACO does).
 #[test]

@@ -894,6 +894,58 @@ fn step(inst: &Inst, at: usize, w: &mut Wave, mem: &mut dyn Memory) -> Result<()
             if rdna::global::atomic(op, 0, 0, 0).is_some() {
                 return global_atomic(&c, w, mem, op, vdst, addr, data, base, offset, glc);
             }
+            let d16 = rdna::global::load_d16(op);
+            let st = rdna::global::store_sub(op);
+            if d16.is_some() || st.is_some() {
+                // (bytes, sign-extended, high half, is a store)
+                let (bytes, signed, hi, store) = match (d16, st) {
+                    (Some((b, s, h)), _) => (b, s, h, false),
+                    (_, Some((b, h))) => (b, false, h, true),
+                    _ => unreachable!(),
+                };
+                let mask = if bytes == 1 { 0xFFu32 } else { 0xFFFF };
+                let mut res = Vec::new();
+                let mut written: Vec<(u64, u32)> = Vec::new();
+                for lane in 0..w.size.lanes() {
+                    if !w.active(lane) {
+                        continue;
+                    }
+                    let a = match base {
+                        None => c.v32(w, 256 + addr as u16, lane)? as u64 | (c.v32(w, 256 + addr as u16 + 1, lane)? as u64) << 32,
+                        Some(b) => b.wrapping_add(c.v32(w, 256 + addr as u16, lane)? as u64),
+                    }
+                    .wrapping_add(offset as i64 as u64);
+                    if a % bytes as u64 != 0 {
+                        return Err(c.err("unaligned sub-dword access"));
+                    }
+                    let mut d = [0u32];
+                    if !mem.read(a & !3, &mut d) {
+                        return Err(ExecError::MemoryFault { at: c.at, addr: a });
+                    }
+                    let sh = 8 * (a & 3) as u32;
+                    if store {
+                        let m = mask << sh;
+                        if written.iter().any(|&(wa, wm)| wa == a & !3 && wm & m != 0) {
+                            return Err(c.err("two lanes store the same byte"));
+                        }
+                        written.push((a & !3, m));
+                        let x = c.v32(w, 256 + data as u16, lane)?;
+                        let x = if hi { x >> 16 } else { x } & mask;
+                        let nd = d[0] & !m | x << sh;
+                        if !mem.write(a & !3, &[nd]) {
+                            return Err(ExecError::MemoryFault { at: c.at, addr: a });
+                        }
+                    } else {
+                        let v = rdna::global::extract(d[0], (a & 3) as u32, bytes, signed) & 0xFFFF;
+                        let old = c.v32(w, 256 + vdst as u16, lane)?;
+                        res.push((lane, if hi { old & 0xFFFF | v << 16 } else { old & 0xFFFF_0000 | v }));
+                    }
+                }
+                for (lane, v) in res {
+                    c.vgpr_mut(w, vdst)?[lane] = v;
+                }
+                return Ok(());
+            }
             if let Some((bytes, signed)) = rdna::global::sub_dword(op) {
                 let mut res = Vec::new();
                 for lane in 0..w.size.lanes() {

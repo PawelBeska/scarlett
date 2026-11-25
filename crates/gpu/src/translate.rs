@@ -2816,7 +2816,10 @@ impl Tr {
         }
         let atomic = atomic_op(opc);
         let sub = global::sub_dword(opc);
+        let d16 = global::load_d16(opc);
+        let st = global::store_sub(opc);
         let (n, store) = match (atomic, sub) {
+            _ if d16.is_some() || st.is_some() => (1, false),
             (Some(_), _) | (_, Some(_)) => (1, false),
             _ => global::access(opc).ok_or_else(|| self.err("opcode"))?,
         };
@@ -2836,6 +2839,63 @@ impl Tr {
         let off_hi = self.c(if offset < 0 { u32::MAX } else { 0 });
         let a = self.add64(base, Pair { lo: off_lo, hi: off_hi });
         let active = self.active();
+        if let Some((bytes, from_hi)) = st {
+            // Clear and set the bytes with atomics on the containing dword,
+            // so lanes storing other bytes of it keep theirs.
+            let (k3, nk3, k8) = (self.c(3), self.c(!3), self.c(8));
+            let lo = self.u(op::BITWISE_AND, &[a.lo, nk3]);
+            let (idx, ok) = self.window_index(win, Pair { lo, hi: a.hi });
+            let ok = self.bl(op::LOGICAL_AND, &[ok, active]);
+            let sink = self.c(win.words);
+            let slot = self.select_u(ok, idx, sink);
+            let p = self.b.op(p_u32, op::ACCESS_CHAIN, &[buf, zero, slot]);
+            let byte = self.u(op::BITWISE_AND, &[a.lo, k3]);
+            let sh = self.u(op::I_MUL, &[byte, k8]);
+            let mask = self.c(if bytes == 1 { 0xFF } else { 0xFFFF });
+            let mut x = self.vsrc(256 + data as u16, 0)?;
+            if from_hi {
+                let k16 = self.c(16);
+                x = self.u(op::SHIFT_RIGHT_LOGICAL, &[x, k16]);
+            }
+            let x = self.u(op::BITWISE_AND, &[x, mask]);
+            let v = self.u(op::SHIFT_LEFT_LOGICAL, &[x, sh]);
+            let m = self.u(op::SHIFT_LEFT_LOGICAL, &[mask, sh]);
+            let nm = self.u(op::NOT, &[m]);
+            let (scope, relaxed) = (self.c(1), self.c(0)); // Device, relaxed
+            self.u(op::ATOMIC_AND, &[p, scope, relaxed, nm]);
+            self.u(op::ATOMIC_OR, &[p, scope, relaxed, v]);
+            return Ok(());
+        }
+        if let Some((bytes, signed, hi)) = d16 {
+            let (k3, nk3, k8) = (self.c(3), self.c(!3), self.c(8));
+            let lo = self.u(op::BITWISE_AND, &[a.lo, nk3]);
+            let dw = self.load_window(buf, p_u32, win, Pair { lo, hi: a.hi });
+            let byte = self.u(op::BITWISE_AND, &[a.lo, k3]);
+            let sh = self.u(op::I_MUL, &[byte, k8]);
+            let x = self.u(op::SHIFT_RIGHT_LOGICAL, &[dw, sh]);
+            let up = self.c(32 - 8 * bytes);
+            let t = self.u(op::SHIFT_LEFT_LOGICAL, &[x, up]);
+            let r = if signed {
+                let ti = self.as_i32(t);
+                let it = self.t.i32t;
+                let r = self.b.op(it, op::SHIFT_RIGHT_ARITHMETIC, &[ti, up]);
+                self.bits_of(r)
+            } else {
+                self.u(op::SHIFT_RIGHT_LOGICAL, &[t, up])
+            };
+            let (m16, k16, mhi) = (self.c(0xFFFF), self.c(16), self.c(0xFFFF_0000));
+            let r = self.u(op::BITWISE_AND, &[r, m16]);
+            let old = self.vsrc(256 + vdst as u16, 0)?;
+            let out = if hi {
+                let keep = self.u(op::BITWISE_AND, &[old, m16]);
+                let up = self.u(op::SHIFT_LEFT_LOGICAL, &[r, k16]);
+                self.u(op::BITWISE_OR, &[keep, up])
+            } else {
+                let keep = self.u(op::BITWISE_AND, &[old, mhi]);
+                self.u(op::BITWISE_OR, &[keep, r])
+            };
+            return self.set_vgpr(vdst, out);
+        }
         if let Some((bytes, signed)) = sub {
             // The containing dword, then shift and zero/sign-extend (the
             // interpreter refuses misaligned addresses).
