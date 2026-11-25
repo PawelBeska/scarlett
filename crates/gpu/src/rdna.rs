@@ -720,6 +720,17 @@ pub mod sop2 {
     pub const S_PACK_LL_B32_B16: u16 = 0x32;
     pub const S_PACK_LH_B32_B16: u16 = 0x33;
     pub const S_PACK_HH_B32_B16: u16 = 0x34;
+    /// D = (S0 << n) + S1, SCC = the addition's unsigned carry (AMD RDNA2
+    /// ISA specification: "iff the summation results in an unsigned
+    /// overflow").
+    pub const S_LSHL1_ADD_U32: u16 = 0x2E;
+    pub const S_LSHL2_ADD_U32: u16 = 0x2F;
+    pub const S_LSHL3_ADD_U32: u16 = 0x30;
+    pub const S_LSHL4_ADD_U32: u16 = 0x31;
+    /// 64-bit s_bfe: offset S1[5:0], width S1[22:16] (widths of 64 and
+    /// more refused), SCC = result != 0.
+    pub const S_BFE_U64: u16 = 0x29;
+    pub const S_BFE_I64: u16 = 0x2A;
 }
 
 pub mod sop1 {
@@ -761,6 +772,22 @@ pub mod sop1 {
     /// specification (amdgpu_isa_rdna2.xml, GPUOpen): its descriptions
     /// give the operand order and which result sets SCC.
     pub const S_CMOV_B64: u16 = 6;
+    /// Whole-quad mode mask: each non-zero 4-bit group becomes 0xF; quad
+    /// mask: bit i = group i non-zero (LLVM ConstantFolding for
+    /// amdgcn_s_wqm / amdgcn_s_quadmask); SCC = result != 0.
+    pub const S_WQM_B32: u16 = 0x09;
+    pub const S_WQM_B64: u16 = 0x0A;
+    pub const S_QUADMASK_B32: u16 = 0x2C;
+    pub const S_QUADMASK_B64: u16 = 0x2D;
+
+    pub fn wqm(x: u64) -> u64 {
+        let x = x | (x & 0x5555_5555_5555_5555) << 1 | (x >> 1 & 0x5555_5555_5555_5555);
+        x | (x & 0x3333_3333_3333_3333) << 2 | (x >> 2 & 0x3333_3333_3333_3333)
+    }
+
+    pub fn quadmask(x: u64) -> u64 {
+        (0..16).filter(|i| x >> (4 * i) & 0xF != 0).fold(0, |r, i| r | 1 << i)
+    }
     pub const S_BCNT0_I32_B64: u16 = 0x0E;
     /// Trailing ones before the first 0; -1 if there is no 0 bit.
     pub const S_FF0_I32_B32: u16 = 0x11;
@@ -2308,6 +2335,16 @@ impl Inst {
             (Format::Sop2, sop2::S_BFE_U32) => "s_bfe_u32",
             (Format::Sop2, sop2::S_BFE_I32) => "s_bfe_i32",
             (Format::Sop1, sop1::S_CMOV_B32) => "s_cmov_b32",
+            (Format::Sop1, sop1::S_WQM_B32) => "s_wqm_b32",
+            (Format::Sop1, sop1::S_WQM_B64) => "s_wqm_b64",
+            (Format::Sop1, sop1::S_QUADMASK_B32) => "s_quadmask_b32",
+            (Format::Sop1, sop1::S_QUADMASK_B64) => "s_quadmask_b64",
+            (Format::Sop2, sop2::S_LSHL1_ADD_U32) => "s_lshl1_add_u32",
+            (Format::Sop2, sop2::S_LSHL2_ADD_U32) => "s_lshl2_add_u32",
+            (Format::Sop2, sop2::S_LSHL3_ADD_U32) => "s_lshl3_add_u32",
+            (Format::Sop2, sop2::S_LSHL4_ADD_U32) => "s_lshl4_add_u32",
+            (Format::Sop2, sop2::S_BFE_U64) => "s_bfe_u64",
+            (Format::Sop2, sop2::S_BFE_I64) => "s_bfe_i64",
             (Format::Sop1, sop1::S_CMOV_B64) => "s_cmov_b64",
             (Format::Sop1, sop1::S_BCNT0_I32_B64) => "s_bcnt0_i32_b64",
             (Format::Sop1, sop1::S_FF0_I32_B32) => "s_ff0_i32_b32",

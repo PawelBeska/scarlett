@@ -3356,6 +3356,51 @@ impl Tr {
                 self.b.store(self.scc, s);
                 Ok(())
             }
+            sop1::S_WQM_B32 | sop1::S_WQM_B64 | sop1::S_QUADMASK_B32 | sop1::S_QUADMASK_B64 => {
+                let wide = matches!(opc, sop1::S_WQM_B64 | sop1::S_QUADMASK_B64);
+                let a = if wide { self.s64(s0, lit)? } else { Pair { lo: self.s32(s0, lit)?, hi: self.c(0) } };
+                // per word: OR each 4-bit group into all its bits
+                let mut spread = |v: Id| {
+                    let mut v = v;
+                    for (sh, m) in [(1, 0x5555_5555u32), (2, 0x3333_3333)] {
+                        let (k, mk) = (self.c(sh), self.c(m));
+                        let lo = self.u(op::BITWISE_AND, &[v, mk]);
+                        let up = self.u(op::SHIFT_LEFT_LOGICAL, &[lo, k]);
+                        let dn = self.u(op::SHIFT_RIGHT_LOGICAL, &[v, k]);
+                        let dn = self.u(op::BITWISE_AND, &[dn, mk]);
+                        let o = self.u(op::BITWISE_OR, &[v, up]);
+                        v = self.u(op::BITWISE_OR, &[o, dn]);
+                    }
+                    v
+                };
+                let (wl, wh) = (spread(a.lo), spread(a.hi));
+                let r = if matches!(opc, sop1::S_WQM_B32 | sop1::S_WQM_B64) {
+                    Pair { lo: wl, hi: wh }
+                } else {
+                    // one bit per group: bit 4i of the spread word -> bit i
+                    let one = self.c(1);
+                    let mut gather = |v: Id, base: u32| {
+                        let mut r = self.c(0);
+                        for i in 0..8 {
+                            let k = self.c(4 * i);
+                            let b = self.u(op::SHIFT_RIGHT_LOGICAL, &[v, k]);
+                            let b = self.u(op::BITWISE_AND, &[b, one]);
+                            let p = self.c(base + i);
+                            let b = self.u(op::SHIFT_LEFT_LOGICAL, &[b, p]);
+                            r = self.u(op::BITWISE_OR, &[r, b]);
+                        }
+                        r
+                    };
+                    let l = gather(wl, 0);
+                    let h = gather(wh, 8);
+                    let lo = self.u(op::BITWISE_OR, &[l, h]);
+                    Pair { lo, hi: self.c(0) }
+                };
+                let any = self.u(op::BITWISE_OR, &[r.lo, r.hi]);
+                let sc = self.nonzero(any);
+                self.b.store(self.scc, sc);
+                if wide { self.set_s64(d, r) } else { self.set_s32(d, r.lo) }
+            }
             sop1::S_CMOV_B64 => {
                 let v = self.s64(s0, lit)?;
                 let old = self.s64(d as u16, 0)?;
@@ -3543,6 +3588,37 @@ impl Tr {
             let lo = self.select_u(sc, a.lo, b.lo);
             let hi = self.select_u(sc, a.hi, b.hi);
             return self.set_s64(d, Pair { lo, hi });
+        }
+        if (sop2::S_LSHL1_ADD_U32..=sop2::S_LSHL4_ADD_U32).contains(&opc) {
+            let (a, b) = (self.s32(s0, lit)?, self.s32(s1, lit)?);
+            let n = self.c((opc - sop2::S_LSHL1_ADD_U32 + 1) as u32);
+            let sh = self.u(op::SHIFT_LEFT_LOGICAL, &[a, n]);
+            let r = self.u(op::I_ADD, &[sh, b]);
+            let carry = self.bl(op::U_LESS_THAN, &[r, sh]);
+            self.b.store(self.scc, carry);
+            return self.set_s32(d, r);
+        }
+        if opc == sop2::S_BFE_U64 || opc == sop2::S_BFE_I64 {
+            let x = self.s64(s0, lit)?;
+            let b = self.s32(s1, lit)?;
+            let (k63, k16, k7f) = (self.c(63), self.c(16), self.c(0x7F));
+            let off = self.u(op::BITWISE_AND, &[b, k63]);
+            let wd = self.u(op::SHIFT_RIGHT_LOGICAL, &[b, k16]);
+            let wd = self.u(op::BITWISE_AND, &[wd, k7f]);
+            let wd = self.u(op::BITWISE_AND, &[wd, k63]); // >= 64 is refused
+            let f = self.shift64(sop2::S_LSHR_B64, x, off);
+            // left-align the field, then shift back logically / arithmetically
+            let k64 = self.c(64);
+            let up = self.u(op::I_SUB, &[k64, wd]);
+            let t = self.shift64(sop2::S_LSHL_B64, f, up);
+            let r = self.shift64(if opc == sop2::S_BFE_I64 { sop2::S_ASHR_I64 } else { sop2::S_LSHR_B64 }, t, up);
+            let zero = self.c(0);
+            let wz = self.bl(op::I_EQUAL, &[wd, zero]);
+            let r = Pair { lo: self.select_u(wz, zero, r.lo), hi: self.select_u(wz, zero, r.hi) };
+            let any = self.u(op::BITWISE_OR, &[r.lo, r.hi]);
+            let sc = self.nonzero(any);
+            self.b.store(self.scc, sc);
+            return self.set_s64(d, r);
         }
         if opc == sop2::S_BFM_B64 {
             // ((1 << n) - 1) << off on a pair, n and off in 0..64

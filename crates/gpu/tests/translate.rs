@@ -3795,6 +3795,46 @@ fn cmp_class() {
     check_all(&code);
 }
 
+/// s_wqm / s_quadmask (b32, b64), s_lshl1..4_add_u32 (SCC = carry of the
+/// addition) and s_bfe_u64/i64 (widths 0, < 32, > 32, signed).
+#[test]
+fn wqm_quadmask_lshl_add_bfe64() {
+    use scarlett_gpu::rdna::sop1::{quadmask, wqm};
+    assert_eq!(wqm(0x0000_0000_0102_8010), 0x0000_0000_0F0F_F0F0);
+    assert_eq!(quadmask(0x8000_0000_0102_8010), 0x8000 | 0b0101_1010); // groups 1, 3, 4, 6 and 15
+    let mut code = vec![
+        sop1e(sop1::S_WQM_B32, 4, 0),
+        sop1e(sop1::S_WQM_B64, 6, 0),
+        sop1e(sop1::S_QUADMASK_B32, 8, 2),
+        sop1e(sop1::S_QUADMASK_B64, 10, 2),
+        sop1e(sop1::S_MOV_B32, 12, int(0)),
+        sop1e(sop1::S_QUADMASK_B32, 13, 12), // 0: SCC = 0
+        sop2e(sop2::S_LSHL1_ADD_U32, 14, 1, 3),
+        sop2e(sop2::S_LSHL4_ADD_U32, 15, 0, 1), // SCC from this one
+        ENDPGM,
+    ];
+    check_all(&code);
+    // carry exactly from the addition: 0x1000_0000 << 4 = 0 + S1: no carry
+    let mut w = Wave::new(WaveSize::W32, NV as usize);
+    w.sgpr[0] = 0x1000_0001;
+    w.sgpr[1] = 0xFFFF_FFF0;
+    interp::run(&[sop2e(sop2::S_LSHL4_ADD_U32, 2, 0, 1), ENDPGM], &mut w, 10).unwrap();
+    assert_eq!((w.sgpr[2], w.scc), (0, true), "0x10 + 0xfffffff0 carries; the shifted-out bit does not count");
+    // bfe64: S1 = offset | width << 16
+    code.clear();
+    for (k, (off, width)) in [(3u32, 0u32), (5, 20), (30, 40), (60, 4), (1, 63)].iter().enumerate() {
+        code.extend([sop1e(sop1::S_MOV_B32, 12, LIT), off | width << 16]);
+        let op = if k % 2 == 0 { sop2::S_BFE_U64 } else { sop2::S_BFE_I64 };
+        code.push(sop2e(op, [4u16, 6, 8, 10, 0][k], 0, 12)); // s[12:13] holds the selector
+        code.push(sop2e(sop2::S_BFE_I64, 14, 2, 12));
+    }
+    code.push(ENDPGM);
+    check_all(&code);
+    let mut w = Wave::new(WaveSize::W32, NV as usize);
+    w.sgpr[1] = 64 << 16;
+    assert!(interp::run(&[sop2e(sop2::S_BFE_U64, 2, 4, 1), ENDPGM], &mut w, 10).is_err(), "width 64");
+}
+
 /// s_bitreplicate_b64_b32 into SGPRs, VCC and EXEC (a lane mask built
 /// from its half, as ACO does).
 #[test]

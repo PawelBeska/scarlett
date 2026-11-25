@@ -1859,6 +1859,27 @@ fn sop2_step(c: &Ctx, w: &mut Wave, op: u16, d: u8, s0: u16, s1: u16) -> Result<
         let v = if w.scc { c.s64(w, s0)? } else { c.s64(w, s1)? };
         return c.set_s64(w, d, v);
     }
+    if (sop2::S_LSHL1_ADD_U32..=sop2::S_LSHL4_ADD_U32).contains(&op) {
+        let n = op - sop2::S_LSHL1_ADD_U32 + 1;
+        let (r, carry) = (c.s32(w, s0)? << n).overflowing_add(c.s32(w, s1)?);
+        w.scc = carry;
+        return c.set_s32(w, d, r);
+    }
+    if op == sop2::S_BFE_U64 || op == sop2::S_BFE_I64 {
+        let (x, b) = (c.s64(w, s0)?, c.s32(w, s1)?);
+        let (off, width) = (b & 63, (b >> 16) & 0x7F);
+        if width >= 64 {
+            return Err(c.err("bit-field width of 64 or more"));
+        }
+        let r = if width == 0 {
+            0
+        } else {
+            let f = (x >> off) & ((1u64 << width) - 1);
+            if op == sop2::S_BFE_I64 { ((f << (64 - width)) as i64 >> (64 - width)) as u64 } else { f }
+        };
+        w.scc = r != 0;
+        return c.set_s64(w, d, r);
+    }
     if op == sop2::S_BFM_B64 {
         let (n, off) = (c.s32(w, s0)? & 63, c.s32(w, s1)? & 63);
         return c.set_s64(w, d, (((1u128 << n) - 1) as u64) << off);
@@ -2048,6 +2069,18 @@ fn sop1_step(c: &Ctx, w: &mut Wave, op: u16, d: u8, s0: u16) -> Result<(), ExecE
             w.exec = (w.exec & !w.size.mask()) | new;
             w.scc = !w.execz();
             Ok(())
+        }
+        sop1::S_WQM_B32 | sop1::S_QUADMASK_B32 => {
+            let x = c.s32(w, s0)? as u64;
+            let r = if op == sop1::S_WQM_B32 { sop1::wqm(x) } else { sop1::quadmask(x) } as u32;
+            w.scc = r != 0;
+            c.set_s32(w, d, r)
+        }
+        sop1::S_WQM_B64 | sop1::S_QUADMASK_B64 => {
+            let x = c.s64(w, s0)?;
+            let r = if op == sop1::S_WQM_B64 { sop1::wqm(x) } else { sop1::quadmask(x) };
+            w.scc = r != 0;
+            c.set_s64(w, d, r)
         }
         sop1::S_CMOV_B64 => {
             if w.scc {
