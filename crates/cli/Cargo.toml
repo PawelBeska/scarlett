@@ -12,3 +12,6 @@ scarlett-loader.workspace = true
 scarlett-gpu.workspace = true
 log.workspace = true
 env_logger.workspace = true
+
+[dev-dependencies]
+scarlett-pe = { workspace = true, features = ["builder"] }

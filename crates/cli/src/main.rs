@@ -1,3 +1,5 @@
+mod inventory;
+
 use scarlett_hle::{vfs, Registry};
 use scarlett_loader::{load, Binding, LoadOptions};
 use scarlett_pe::{Dir, PeFile};
@@ -6,6 +8,11 @@ use std::process::ExitCode;
 const USAGE: &str = "\
 usage:
   scarlett inspect <image>
+  scarlett inventory <game dir> [--md <report.md>] [--top N]
+                       every PE image under the folder; each import marked as
+                       provided by the package, by HLE, or missing (host
+                       forwarding not evaluated); per image, per module and
+                       the most imported missing symbols (default top 50)
   scarlett disasm <shader.bin> [byte offset]   RDNA2 listing of a raw shader dump
   scarlett translate <shader.bin> -o <out.spv> [--offset N] [--wave32]
                        [--emulate-cross-lane]   (wave64 on 32-wide subgroups)
@@ -48,6 +55,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
         Some("inspect") if args.len() == 2 => inspect(&args[1]),
+        Some("inventory") if args.len() >= 2 => inventory_cmd(&args[1], &args[2..]),
         Some("run") if args.len() >= 2 => run(&args[1], &args[2..]),
         Some("disasm") if (2..=3).contains(&args.len()) => disasm(&args[1], args.get(2)),
         Some("translate") if args.len() >= 2 => translate(&args[1], &args[2..]),
@@ -67,6 +75,26 @@ fn main() -> ExitCode {
 }
 
 type Res = Result<ExitCode, Box<dyn std::error::Error>>;
+
+fn inventory_cmd(dir: &str, flags: &[String]) -> Res {
+    let (mut md, mut top) = (None, 50);
+    let mut it = flags.iter();
+    while let Some(f) = it.next() {
+        match f.as_str() {
+            "--md" => md = Some(it.next().ok_or("--md needs a path")?.clone()),
+            "--top" => top = parse_num(it.next().ok_or("--top needs a number")?)?,
+            other => return Err(format!("unknown flag {other}").into()),
+        }
+    }
+    let inv = inventory::inventory(std::path::Path::new(dir))?;
+    let report = inventory::markdown(&inv, top);
+    print!("{report}");
+    if let Some(p) = md {
+        std::fs::write(&p, &report)?;
+        eprintln!("report written to {p}");
+    }
+    Ok(ExitCode::SUCCESS)
+}
 
 fn inspect(path: &str) -> Res {
     let bytes = std::fs::read(path)?;

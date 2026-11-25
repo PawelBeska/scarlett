@@ -81,7 +81,7 @@ dostarczony w trakcie kodu gościa widzi `gs` gościa.
 
 `scarlett-gpu` testuje się także natywnie (`cargo test -p scarlett-gpu`, bez Rosetty).
 
-167 testów (+1 tylko na Linuxie), w tym end-to-end: zbudowany PE z ręcznie złożonym x86-64
+168 testów (+1 tylko na Linuxie), w tym end-to-end: zbudowany PE z ręcznie złożonym x86-64
 ładuje się, relokuje, wykonuje natywnie i woła handlery w Ruście (6 argumentów, w tym 2 ze stosu);
 statyczny TLS (`gs:[0x58]` → `_tls_index` → blok skopiowany z szablonu, zero-fill, wyrównanie,
 osobna kopia na wątek), sloty `TlsAlloc` / last error czytane przez gościa bezpośrednio z TEB,
@@ -114,7 +114,20 @@ procesu, co trzeba zweryfikować przy pierwszym `cargo test` pod MSVC.
 Rozpakowany plik PE z **legalnego** źródła: własne programy z Dev Mode, sample z GDK.
 Rozpakowywanie i deszyfrowanie paczek konsolowych jest poza zakresem projektu.
 
+## Inwentarz importów
+
+`scarlett inventory <katalog gry> [--md <raport.md>] [--top N]` przechodzi wszystkie obrazy PE
+w katalogu (rekurencyjnie) i dla każdego importu ustala dostawcę: eksport innego obrazu paczki
+(po nazwie albo ordinalu, nazwa modułu bez rozróżniania wielkości liter), handler HLE albo brak.
+Raport (Markdown, na stdout i opcjonalnie do pliku poza repozytorium) ma podsumowanie z
+odsetkiem importów z dostawcą, tabelę per obraz, braki per moduł docelowy i najczęściej
+importowane brakujące symbole. Przekierowanie na DLL hosta nie jest tu oceniane. To etap 1
+planu z [docs/ROADMAP.md](docs/ROADMAP.md).
+
 ## Roadmapa
+
+Plan dojścia do uruchomionej gry: [docs/ROADMAP.md](docs/ROADMAP.md). Historia wcześniejszych
+etapów:
 
 4. ~~**TLS i TEB**: statyczny TLS (`gs:[0x58]`), indeks TLS, `__declspec(thread)`.~~ Zrobione.
 5. ~~**xmm w trampolinie**: przekazywanie argumentów i zwrotów float/SIMD.~~ Zrobione (`Call::arg_f64/arg_f32`, `ret_f64/ret_f32/ret_xmm`).
