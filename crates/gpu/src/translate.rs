@@ -2811,7 +2811,8 @@ impl Tr {
         seg: u8,
         glc: bool,
     ) -> Res<()> {
-        if seg != global::SEG_GLOBAL {
+        // flat: as global (the interpreter refuses aperture addresses)
+        if seg != global::SEG_GLOBAL && !(seg == global::SEG_FLAT && saddr == global::SADDR_OFF) {
             return Err(self.err("FLAT segment other than global"));
         }
         let atomic = atomic_op(opc);

@@ -1188,6 +1188,9 @@ pub mod smem {
 /// base plus a 32-bit VGPR offset.
 pub mod global {
     pub const SEG_GLOBAL: u8 = 2;
+    /// The flat segment: the same opcodes as global (`flat_*` in LLVM's
+    /// `FLATInstructions.td` and the AMD RDNA2 ISA specification).
+    pub const SEG_FLAT: u8 = 0;
     pub const SADDR_OFF: u8 = 125;
     pub const LOAD_DWORD: u16 = 12;
     pub const LOAD_DWORDX2: u16 = 13;
@@ -2649,6 +2652,8 @@ impl Inst {
         };
         if known.is_empty() {
             format!("{}_op{}", self.format.prefix(), self.opcode)
+        } else if let (Some(rest), Fields::Flat { seg: global::SEG_FLAT, .. }) = (known.strip_prefix("global_"), &self.fields) {
+            format!("flat_{rest}")
         } else {
             known.to_string()
         }

@@ -77,6 +77,7 @@ fn check_mem(code: &[u32], size: WaveSize, seed: u32, sparse: bool, mem: Mem) {
     w.vgpr.clone_from(&vgprs);
     w.exec = exec;
     w.code_base = CODE_BASE;
+    w.flat_apertures = Some(APERTURES);
     let mut memory = SparseMemory::new();
     if let Some((base, data)) = mem {
         memory.map(base, 4 * data.len() as u64);
@@ -552,6 +553,8 @@ fn global_loads_and_stores() {
 const SAVE_OR_RESTORE: u16 = 0x7F;
 
 const GBASE: u64 = 0x3_0000_1000;
+/// LDS / scratch apertures (high words) for the tests: away from GBASE.
+const APERTURES: (u32, u32) = (0x1_0000, 0x2_0000);
 
 /// DS: w0 = 0xD8000000 | op<<18 | offset1<<8 | offset0;
 ///     w1 = vdst<<24 | data1<<16 | data0<<8 | addr
@@ -3625,6 +3628,63 @@ fn global_sub_dword_stores_and_d16_loads() {
     let mut c = flat(global::STORE_BYTE, 0, 7, 0, 0).to_vec();
     c.push(ENDPGM);
     assert!(interp::run_with_memory(&c, &mut w, &mut memory, 10).is_err());
+}
+
+/// FLAT (segment 0) as global outside the apertures: dword, x2, byte
+/// loads/stores, d16 loads and an atomic through v[0:1]-style 64-bit
+/// addresses; aperture addresses and unknown apertures refused; the
+/// decoder names them flat_*.
+#[test]
+fn flat_as_global() {
+    let flat = |op: u16, vdst: u32, addr: u32, data: u32, offset: u32, glc: bool| {
+        [0xDC00_0000 | (op as u32) << 18 | (glc as u32) << 16 | offset, vdst << 24 | 0x7D << 16 | data << 8 | addr]
+    };
+    // LLVM flat-gfx10.s: flat_load_dword v1, v[3:4] offset:2047
+    assert_eq!(flat(global::LOAD_DWORD, 1, 3, 0, 2047, false), [0xDC30_07FF, 0x017D_0003]);
+    let d = scarlett_gpu::rdna::decode(&flat(global::STORE_SHORT_D16_HI, 0, 3, 1, 0, false), 0).unwrap();
+    assert_eq!(d.mnemonic(), "flat_store_short_d16_hi");
+    let table: Vec<u32> = (0..320u32).map(|k| k.wrapping_mul(0x9E37_79B9) ^ 0x8080_8080).collect();
+    let mut code = vec![];
+    code.extend(vop3e(vop3::V_MBCNT_LO_U32_B32, 6, [int(-1), int(0), 0]));
+    code.extend(vop3e(vop3::V_MBCNT_HI_U32_B32, 6, [int(-1), v(6), 0]));
+    code.push(vop2e(vop2::V_LSHLREV_B32, 6, int(3), 6)); // 8 * lane
+    code.extend([vop2e(vop2::V_ADD_NC_U32, 6, LIT, 6), GBASE as u32]);
+    code.extend([vop1e(vop1::V_MOV_B32, 7, LIT), (GBASE >> 32) as u32]); // v[6:7] = GBASE + 8 lane
+    code.extend(flat(global::LOAD_DWORDX2, 4, 6, 0, 4, false));
+    code.extend(flat(global::STORE_DWORDX2, 0, 6, 0, 8, false));
+    code.extend(flat(global::STORE_BYTE, 0, 6, 2, 1, false));
+    code.extend(flat(global::LOAD_SBYTE, 3, 6, 0, 515, false));
+    code.extend(flat(global::LOAD_SHORT_D16_HI, 2, 6, 0, 6, false));
+    code.extend(flat(global::ATOMIC_ADD, 1, 6, 3, 0, true));
+    code.push(ENDPGM);
+    for size in [WaveSize::W32, WaveSize::W64] {
+        for seed in 0..3 {
+            for sparse in [false, true] {
+                check_mem(&code, size, seed, sparse, Some((GBASE, &table)));
+            }
+        }
+    }
+    // memory is mapped at every address tried, so only the aperture
+    // check can refuse
+    let run = |hi: u32, lo: u32, offset: u32, apertures: Option<(u32, u32)>| {
+        let mut memory = SparseMemory::new();
+        let at = ((hi as u64) << 32 | lo as u64) + offset as u64;
+        memory.map(at & !0xFFF, 0x2000);
+        let mut w = Wave::new(WaveSize::W32, NV as usize);
+        w.exec = 1;
+        w.flat_apertures = apertures;
+        w.vgpr[6][0] = lo;
+        w.vgpr[7][0] = hi;
+        let mut c = flat(global::LOAD_DWORD, 1, 6, 0, offset, false).to_vec();
+        c.push(ENDPGM);
+        interp::run_with_memory(&c, &mut w, &mut memory, 10).is_ok()
+    };
+    let g = (GBASE >> 32) as u32;
+    assert!(run(g, GBASE as u32, 0, Some(APERTURES)));
+    assert!(!run(g, GBASE as u32, 0, None), "unknown apertures");
+    assert!(!run(APERTURES.0, 0x100, 0, Some(APERTURES)), "LDS aperture");
+    assert!(!run(APERTURES.1, 0x100, 0, Some(APERTURES)), "scratch aperture");
+    assert!(!run(APERTURES.0 - 1, 0xFFFF_FFFC, 8, Some(APERTURES)), "the offset carries into the LDS aperture");
 }
 
 /// s_bitreplicate_b64_b32 into SGPRs, VCC and EXEC (a lane mask built

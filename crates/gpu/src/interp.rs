@@ -89,6 +89,13 @@ pub struct Wave {
     pub attrs: Vec<[[u32; 4]; 3]>,
     /// GPU address of the code's first dword, for `s_getpc_b64`.
     pub code_base: u64,
+    /// High 32 bits of the LDS and scratch apertures of the flat address
+    /// space (`src_shared_base` / `src_private_base`; LLVM's
+    /// getBaseSegmentAperture: a local pointer becomes aperture << 32 |
+    /// offset). Set by the system, not the shader: None refuses every FLAT
+    /// access, and FLAT addresses inside an aperture are refused too
+    /// (only the global part is modelled).
+    pub flat_apertures: Option<(u32, u32)>,
 }
 
 /// One lane's export: target (0..7 MRT, 9 null), enabled components and
@@ -117,6 +124,7 @@ impl Wave {
             exports: Vec::new(),
             attrs: Vec::new(),
             code_base: 0,
+            flat_apertures: None,
         }
     }
 
@@ -883,7 +891,27 @@ fn step(inst: &Inst, at: usize, w: &mut Wave, mem: &mut dyn Memory) -> Result<()
             },
             op,
         ) => {
-            if seg != rdna::global::SEG_GLOBAL {
+            if seg == rdna::global::SEG_FLAT {
+                // global unless the address falls in the LDS or scratch
+                // aperture (refused)
+                let (shared, private) = w.flat_apertures.ok_or_else(|| c.err("FLAT access with unknown apertures"))?;
+                if saddr != rdna::global::SADDR_OFF || offset < 0 {
+                    return Err(c.err("FLAT with saddr or a negative offset"));
+                }
+                for lane in 0..w.size.lanes() {
+                    if w.active(lane) {
+                        let hi = c.v32(w, 256 + addr as u16 + 1, lane)?;
+                        let lo = c.v32(w, 256 + addr as u16, lane)?;
+                        // the offset may carry into the high word
+                        let a = (hi as u64) << 32 | lo as u64;
+                        let a = a.wrapping_add(offset as u64);
+                        let ahi = (a >> 32) as u32;
+                        if ahi == shared || ahi == private {
+                            return Err(c.err("FLAT address in the LDS or scratch aperture"));
+                        }
+                    }
+                }
+            } else if seg != rdna::global::SEG_GLOBAL {
                 return Err(c.err("FLAT segment other than global"));
             }
             let base = if saddr == rdna::global::SADDR_OFF {
