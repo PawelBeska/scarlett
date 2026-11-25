@@ -3507,7 +3507,7 @@ fn valu_from_amd_spec() {
     let lt_u = Compare::decode(0xE1).unwrap();
     assert!(lt_i.eval64(u64::MAX, 0) && !lt_u.eval64(u64::MAX, 0));
     assert!(lt_u.eval64(0x1_0000_0000, 0x1_0000_0001) && Compare::decode(0xB2).unwrap().cmpx);
-    assert!(Compare::decode(0xE8).is_none(), "no ninth u64 condition (0xA8 is v_cmp_f_u16)");
+    assert!(Compare::decode(0xE8).is_none(), "no ninth u64 condition (0xA8 is v_cmp_class_f64)");
 
     let mut code = vec![];
     for op in [vop3::V_SAD_U8, vop3::V_SAD_HI_U8, vop3::V_SAD_U16, vop3::V_SAD_U32, vop3::V_LERP_U8, vop3::V_MAD_U32_U16, vop3::V_MAD_I32_I16] {
@@ -3537,7 +3537,7 @@ fn valu_from_amd_spec() {
 }
 
 /// 16-bit integer ops from AMD's RDNA2 ISA specification: the i16/u16
-/// compares (low halves; high halves differ from the low ones' sign) and
+/// compares lt..ge (low halves; high halves differ from the low ones' sign) and
 /// v_add/sub_nc_i16, v_mad_u16/i16, v_min3/max3/med3_{i16,u16}.
 #[test]
 fn int16_from_amd_spec() {
@@ -3545,7 +3545,8 @@ fn int16_from_amd_spec() {
     let lt_i = Compare::decode(0x89).unwrap();
     let lt_u = Compare::decode(0xA9).unwrap();
     assert!(lt_i.eval(0x0000_FFFF, 0xFFFF_0001) && !lt_u.eval(0x0000_FFFF, 0xFFFF_0001), "-1 < 1 signed only");
-    assert!(Compare::decode(0x99).unwrap().cmpx && Compare::decode(0xBF).unwrap().cmpx);
+    assert!(Compare::decode(0x99).unwrap().cmpx && Compare::decode(0xBE).unwrap().cmpx);
+    assert!(Compare::decode(0x8F).is_none() && Compare::decode(0xAF).is_none(), "class_f16 / nothing");
     assert_eq!(vop3_16_3(vop3::V_MED3_I16, 0xFFFF, 5, 0x8000), Some(0xFFFF), "med(-1, 5, -32768)");
     assert_eq!(vop3_16_3(vop3::V_MED3_U16, 0xFFFF, 5, 0x8000), Some(0x8000));
     assert_eq!(vop3_16_3(vop3::V_MAD_U16, 0x1_0100, 0x100, 7), Some(7), "0x100 * 0x100 wraps");
@@ -3561,7 +3562,7 @@ fn int16_from_amd_spec() {
     code.push(vop1e(vop1::V_MOV_B32, 6, int(0)));
     code.push(vop1e(vop1::V_MOV_B32, 7, int(0)));
     for base in [0x88u16, 0xA8] {
-        for cond in 0..8 {
+        for cond in 1..7 {
             code.push(vopce(base + cond, v(0), 1));
             code.push(vop2e(vop2::V_ADD_CO_CI_U32, 6, v(6), 6));
             code.push(vopce(base + cond, v(1), 2));
@@ -3751,6 +3752,47 @@ fn bpermute_and_buffer_sub_dword_stores() {
             }
         }
     }
+}
+
+/// v_cmp(x)_class_f32/f64: each of the ten classes by hand (LLVM's
+/// FPClassTest bits), then special values from SGPRs against random masks.
+#[test]
+fn cmp_class() {
+    use scarlett_gpu::interp::{fp_class, Compare};
+    let f = |x: f32| fp_class(x.to_bits() as u64, 8, 23);
+    let d = |x: f64| fp_class(x.to_bits(), 11, 52);
+    let f32s = [f32::from_bits(0x7F80_0001), f32::NAN, f32::NEG_INFINITY, -1.5, -f32::from_bits(1), -0.0, 0.0, f32::from_bits(1), 2.0, f32::INFINITY];
+    let f64s = [f64::from_bits(0x7FF0_0000_0000_0001), f64::NAN, f64::NEG_INFINITY, -1.5, -f64::from_bits(1), -0.0, 0.0, f64::from_bits(1), 2.0, f64::INFINITY];
+    for (k, (&x, &y)) in f32s.iter().zip(&f64s).enumerate() {
+        assert_eq!(f(x), 1 << k, "f32 class {k}");
+        assert_eq!(d(y), 1 << k, "f64 class {k}");
+    }
+    let c = Compare::decode(0x88).unwrap();
+    assert!(c.eval(f32::NAN.to_bits(), 0b10) && !c.eval(f32::NAN.to_bits(), 0b01));
+    assert!(Compare::decode(0xB8).unwrap().cmpx);
+    assert_eq!(scarlett_gpu::rdna::decode(&[vopce(0xA8, v(1), 2)], 0).unwrap().mnemonic(), "v_cmp_class_f64");
+
+    let mut code = vec![vop2e(vop2::V_AND_B32, 1, LIT, 1), 0x3FF, vop1e(vop1::V_MOV_B32, 6, int(0)), vop1e(vop1::V_MOV_B32, 7, int(0))];
+    for (k, x) in f32s.iter().enumerate() {
+        code.extend([sop1e(sop1::S_MOV_B32, 4, LIT), x.to_bits()]);
+        code.push(vopce(0x88, 4, 1));
+        code.push(vop2e(vop2::V_ADD_CO_CI_U32, 6, v(6), 6));
+        let b = f64s[k].to_bits();
+        code.extend([sop1e(sop1::S_MOV_B32, 4, LIT), b as u32, sop1e(sop1::S_MOV_B32, 5, LIT), (b >> 32) as u32]);
+        code.push(vopce(0xA8, 4, 1));
+        code.push(vop2e(vop2::V_ADD_CO_CI_U32, 7, v(7), 7));
+        code.push(vop2e(vop2::V_LSHRREV_B32, 1, int(1), 1)); // next mask bits
+        code.push(vop2e(vop2::V_XOR_B32, 1, v(0), 1));
+        code.push(vop2e(vop2::V_AND_B32, 1, LIT, 1));
+        code.push(0x3FF);
+    }
+    code.push(vopce(0x88, v(0), 1)); // random f32 bits
+    code.push(vop2e(vop2::V_ADD_CO_CI_U32, 6, v(6), 6));
+    code.extend(vop3e(0x88, 10, [v(2), v(1), 0])); // VOP3 form into s[10(:11)]
+    code.push(vopce(0x98 + 0x20, v(2), 1)); // v_cmpx_class_f64 on v[2:3]
+    code.push(vop1e(vop1::V_MOV_B32, 5, int(7)));
+    code.push(ENDPGM);
+    check_all(&code);
 }
 
 /// s_bitreplicate_b64_b32 into SGPRs, VCC and EXEC (a lane mask built

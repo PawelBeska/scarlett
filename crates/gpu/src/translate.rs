@@ -898,6 +898,48 @@ impl Tr {
         Pair { hi: self.select_u(neg, nh, fh), lo: self.select_u(neg, nl, p.lo) }
     }
 
+    /// v_cmp_class (see `interp::fp_class`): does `mask` contain the class
+    /// bit of the float in `x` (f32 in x.lo when ebits = 8, else the f64
+    /// pair)? Classified from the sign, exponent and mantissa words.
+    fn fp_class_test(&mut self, x: Pair, mask: Id, ebits: u32) -> Id {
+        let f64v = ebits == 11;
+        let top = if f64v { x.hi } else { x.lo };
+        let (k31, one, zero) = (self.c(31), self.c(1), self.c(0));
+        let sgn = self.u(op::SHIFT_RIGHT_LOGICAL, &[top, k31]);
+        let neg = self.nonzero(sgn);
+        let tm = if f64v { 20 } else { 23 };
+        let ks = self.c(tm);
+        let e = self.u(op::SHIFT_RIGHT_LOGICAL, &[top, ks]);
+        let emask = self.c((1 << ebits) - 1);
+        let e = self.u(op::BITWISE_AND, &[e, emask]);
+        let mhi = self.c((1 << tm) - 1);
+        let mtop = self.u(op::BITWISE_AND, &[top, mhi]);
+        let mall = if f64v { self.u(op::BITWISE_OR, &[mtop, x.lo]) } else { mtop };
+        let mnz = self.nonzero(mall);
+        let qbit = self.c(1 << (tm - 1));
+        let q = self.u(op::BITWISE_AND, &[top, qbit]);
+        let quiet = self.nonzero(q);
+        let emaxc = self.c((1 << ebits) - 1);
+        let is_max = self.bl(op::I_EQUAL, &[e, emaxc]);
+        let is_zero_e = self.bl(op::I_EQUAL, &[e, zero]);
+        let pick = |tr: &mut Self, n: u32, p: u32| {
+            let (a, b) = (tr.c(n), tr.c(p));
+            tr.select_u(neg, a, b)
+        };
+        let normal = pick(self, 3, 8);
+        let sub = pick(self, 4, 7);
+        let zer = pick(self, 5, 6);
+        let inf = pick(self, 2, 9);
+        let nan = self.select_u(quiet, one, zero);
+        let in_zero = self.select_u(mnz, sub, zer);
+        let in_max = self.select_u(mnz, nan, inf);
+        let idx = self.select_u(is_zero_e, in_zero, normal);
+        let idx = self.select_u(is_max, in_max, idx);
+        let bit = self.u(op::SHIFT_RIGHT_LOGICAL, &[mask, idx]);
+        let bit = self.u(op::BITWISE_AND, &[bit, one]);
+        self.nonzero(bit)
+    }
+
     /// i64 / u64 VOPC condition `cond` on register pairs: the high words
     /// decide (signed for i64) unless equal, then the low words unsigned.
     fn compare_int64(&mut self, cond: u16, a: Pair, b: Pair, signed: bool) -> Id {
@@ -1085,6 +1127,10 @@ impl Tr {
     /// A VOPC condition on two 32-bit values (see `interp::Compare`).
     fn compare_with(&mut self, cmp: crate::interp::Compare, a: Id, b: Id) -> Id {
         use crate::interp::CmpKind;
+        if cmp.kind == CmpKind::Class32 {
+            let zero = self.c(0);
+            return self.fp_class_test(Pair { lo: a, hi: zero }, b, 8);
+        }
         let (t, f) = (self.b.constant_bool(true), self.b.constant_bool(false));
         if cmp.kind == CmpKind::F32 {
             let (x, y) = (self.as_f32(a), self.as_f32(b));
@@ -2014,7 +2060,11 @@ impl Tr {
             }
             (&Fields::Vopc { src0, vsrc1 }, _, opc) => {
                 let cmp = crate::interp::Compare::decode(opc).ok_or_else(|| self.err("opcode"))?;
-                let cond = if cmp.wide() {
+                let cond = if cmp.kind == crate::interp::CmpKind::Class64 {
+                    let a = self.src64(src0, lit)?;
+                    let mask = self.vsrc(256 + vsrc1 as u16, lit)?;
+                    self.fp_class_test(a, mask, 11)
+                } else if cmp.wide() {
                     let a = self.src64(src0, lit)?;
                     let b = self.src64(256 + vsrc1 as u16, lit)?;
                     match cmp.kind {

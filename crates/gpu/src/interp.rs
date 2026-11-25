@@ -380,20 +380,28 @@ pub enum CmpKind {
     /// 64-bit integer compares on register pairs (VOPC e32 only).
     I64,
     U64,
-    /// 16-bit compares of the low halves.
+    /// 16-bit compares of the low halves (conditions lt..ge only).
     I16,
     U16,
+    /// v_cmp_class_f32 / _f64: S0 (a float, a pair for f64) tested
+    /// against the class mask in S1 (cond unused).
+    Class32,
+    Class64,
 }
 
 impl Compare {
     pub fn decode(op: u16) -> Option<Self> {
         let (kind, rel) = match op {
-            // i16 / u16 sit in the condition slots 8..15 of the i32 / i64
-            // groups (AMD RDNA2 ISA specification)
-            0x88..=0x8F => (CmpKind::I16, op - 0x88),
-            0x98..=0x9F => (CmpKind::I16, op - 0x98 + 16),
-            0xA8..=0xAF => (CmpKind::U16, op - 0xA8),
-            0xB8..=0xBF => (CmpKind::U16, op - 0xB8 + 16),
+            // AMD RDNA2 ISA specification: slots 8..15 of the i32 / i64
+            // groups hold class_f32 / class_f64 (slot 8), the i16 / u16
+            // conditions lt..ge (9..14) and class_f16 or nothing (15)
+            0x88 | 0x98 => (CmpKind::Class32, (op - 0x88) & 16),
+            0xA8 | 0xB8 => (CmpKind::Class64, (op - 0xA8) & 16),
+            0x89..=0x8E => (CmpKind::I16, op - 0x88),
+            0x99..=0x9E => (CmpKind::I16, op - 0x98 + 16),
+            0xA9..=0xAE => (CmpKind::U16, op - 0xA8),
+            0xB9..=0xBE => (CmpKind::U16, op - 0xB8 + 16),
+            0x8F | 0x9F | 0xAF | 0xBF => return None,
             0..=31 => (CmpKind::F32, op),
             32..=63 => (CmpKind::F64, op - 32),
             128..=151 => (CmpKind::I32, op - 128),
@@ -404,7 +412,7 @@ impl Compare {
         };
         let cmpx = rel & 16 != 0;
         let cond = rel & 15;
-        if !matches!(kind, CmpKind::F32 | CmpKind::F64) && cond > 7 {
+        if !matches!(kind, CmpKind::F32 | CmpKind::F64 | CmpKind::Class32 | CmpKind::Class64) && cond > 7 {
             return None;
         }
         Some(Compare { kind, cond, cmpx })
@@ -420,6 +428,7 @@ impl Compare {
         match self.kind {
             CmpKind::F32 => float_cond(self.cond, f32::from_bits(a) as f64, f32::from_bits(b) as f64),
             CmpKind::F64 => float_cond(self.cond, f64::from_bits(a as u64), f64::from_bits(b as u64)),
+            CmpKind::Class32 => fp_class(a as u64, 8, 23) & b != 0,
             CmpKind::I16 => int_cond(self.cond, (a as u16 as i16).cmp(&(b as u16 as i16))),
             CmpKind::U16 => int_cond(self.cond, (a as u16).cmp(&(b as u16))),
             _ => {
@@ -440,14 +449,42 @@ impl Compare {
         match self.kind {
             CmpKind::I64 => int_cond(self.cond, (a as i64).cmp(&(b as i64))),
             CmpKind::U64 => int_cond(self.cond, a.cmp(&b)),
+            CmpKind::Class64 => fp_class(a, 11, 52) & b as u32 != 0,
             _ => float_cond(self.cond, f64::from_bits(a), f64::from_bits(b)),
         }
     }
 
     /// Operands are 64-bit register pairs.
     pub fn wide(&self) -> bool {
-        matches!(self.kind, CmpKind::F64 | CmpKind::I64 | CmpKind::U64)
+        matches!(self.kind, CmpKind::F64 | CmpKind::I64 | CmpKind::U64 | CmpKind::Class64)
     }
+}
+
+/// The class bit of a float's bit pattern (exponent and mantissa widths
+/// given), in LLVM's FPClassTest order, which v_cmp_class takes as its mask
+/// (SIISelLowering builds AMDGPUISD::FP_CLASS from fc* constants): sNaN 0,
+/// qNaN 1, -Inf 2, -normal 3, -subnormal 4, -0 5, +0 6, +subnormal 7,
+/// +normal 8, +Inf 9. On the raw bits: "cmp_class ignores the FP mode"
+/// (VOPCInstructions.td).
+pub fn fp_class(bits: u64, ebits: u32, mbits: u32) -> u32 {
+    let neg = bits >> (ebits + mbits) & 1 != 0;
+    let e = bits >> mbits & ((1 << ebits) - 1);
+    let m = bits & ((1 << mbits) - 1);
+    let emax = (1 << ebits) - 1;
+    let bit = if e == emax && m != 0 {
+        if m >> (mbits - 1) & 1 != 0 { 1 } else { 0 }
+    } else if e == emax {
+        if neg { 2 } else { 9 }
+    } else if e == 0 && m == 0 {
+        if neg { 5 } else { 6 }
+    } else if e == 0 {
+        if neg { 4 } else { 7 }
+    } else if neg {
+        3
+    } else {
+        8
+    };
+    1 << bit
 }
 
 /// Integer conditions in opcode order: f, lt, eq, le, gt, ne, ge, t (AMD's
@@ -750,7 +787,9 @@ fn step(inst: &Inst, at: usize, w: &mut Wave, mem: &mut dyn Memory) -> Result<()
         (&Fields::Vopc { src0, vsrc1 }, op) => {
             let cmp = Compare::decode(op).ok_or_else(|| c.err("opcode"))?;
             let b = 256 + vsrc1 as u16;
-            let m = if cmp.wide() {
+            let m = if cmp.kind == CmpKind::Class64 {
+                compare_mask(w, |l| Ok(cmp.eval64(src64(&c, w, src0, l)?, c.v32(w, b, l)? as u64)))?
+            } else if cmp.wide() {
                 compare_mask(w, |l| Ok(cmp.eval64(src64(&c, w, src0, l)?, src64(&c, w, b, l)?)))?
             } else {
                 compare_mask(w, |l| Ok(cmp.eval(c.v32(w, src0, l)?, c.v32(w, b, l)?)))?
