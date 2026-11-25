@@ -396,7 +396,7 @@ fn compare_truth_table_by_hand() {
     assert!(!lt_u.eval(u32::MAX, 0), "0xffffffff > 0 unsigned");
     // 136 = 0x88 is v_cmp_class_f32 (AMD RDNA2 ISA spec); u32 has no ninth slot
     assert_eq!(Compare::decode(136).unwrap().kind, CmpKind::Class32);
-    assert!(Compare::decode(0xC8).is_none(), "no ninth u32 condition");
+    assert_eq!(Compare::decode(0xC8).unwrap().kind, CmpKind::F16, "0xC8 is v_cmp_f_f16, not a ninth u32 condition");
 }
 
 #[test]

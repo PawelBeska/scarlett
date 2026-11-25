@@ -898,6 +898,56 @@ impl Tr {
         Pair { hi: self.select_u(neg, nh, fh), lo: self.select_u(neg, nl, p.lo) }
     }
 
+    /// The f16 in the low half of `v` placed in a double pattern with the
+    /// same order, ±0 and NaN-ness (compare64 only looks at those): sign
+    /// to bit 63, exponent e to e << 20 (31 to 0x7FF), mantissa to bits
+    /// 10..19 of the high word. Not the double's value.
+    fn half_as_f64(&mut self, v: Id) -> Pair {
+        let (k15, k10) = (self.c(15), self.c(10));
+        let (e5, m10, one) = (self.c(0x1F), self.c(0x3FF), self.c(1));
+        let s = self.u(op::SHIFT_RIGHT_LOGICAL, &[v, k15]);
+        let s = self.u(op::BITWISE_AND, &[s, one]);
+        let k31 = self.c(31);
+        let s = self.u(op::SHIFT_LEFT_LOGICAL, &[s, k31]);
+        let e = self.u(op::SHIFT_RIGHT_LOGICAL, &[v, k10]);
+        let e = self.u(op::BITWISE_AND, &[e, e5]);
+        let emax = self.bl(op::I_EQUAL, &[e, e5]);
+        let k7ff = self.c(0x7FF);
+        let e = self.select_u(emax, k7ff, e);
+        let k20 = self.c(20);
+        let e = self.u(op::SHIFT_LEFT_LOGICAL, &[e, k20]);
+        let m = self.u(op::BITWISE_AND, &[v, m10]);
+        let m = self.u(op::SHIFT_LEFT_LOGICAL, &[m, k10]);
+        let hi = self.u(op::BITWISE_OR, &[s, e]);
+        let hi = self.u(op::BITWISE_OR, &[hi, m]);
+        Pair { lo: self.c(0), hi }
+    }
+
+    /// The f16 in the low half of `v` as f32 bits of the same class: sign,
+    /// exponent 0 / 31 / e + 112 to 0 / 255 / e + 112, mantissa << 13 (so a
+    /// denormal stays subnormal and the quiet bit lands on bit 22).
+    fn half_as_f32_class(&mut self, v: Id) -> Id {
+        let (k15, k10, k13, k23, k31) = (self.c(15), self.c(10), self.c(13), self.c(23), self.c(31));
+        let (e5, m10, one, zero) = (self.c(0x1F), self.c(0x3FF), self.c(1), self.c(0));
+        let s = self.u(op::SHIFT_RIGHT_LOGICAL, &[v, k15]);
+        let s = self.u(op::BITWISE_AND, &[s, one]);
+        let s = self.u(op::SHIFT_LEFT_LOGICAL, &[s, k31]);
+        let e = self.u(op::SHIFT_RIGHT_LOGICAL, &[v, k10]);
+        let e = self.u(op::BITWISE_AND, &[e, e5]);
+        let k112 = self.c(112);
+        let eb = self.u(op::I_ADD, &[e, k112]);
+        let emax = self.bl(op::I_EQUAL, &[e, e5]);
+        let ezero = self.bl(op::I_EQUAL, &[e, zero]);
+        let kff = self.c(0xFF);
+        let e = self.select_u(emax, kff, eb);
+        let e = self.select_u(ezero, zero, e);
+        let e = self.u(op::SHIFT_LEFT_LOGICAL, &[e, k23]);
+        let m = self.u(op::BITWISE_AND, &[v, m10]);
+        let m = self.u(op::SHIFT_LEFT_LOGICAL, &[m, k13]);
+        let r = self.u(op::BITWISE_OR, &[s, e]);
+        self.u(op::BITWISE_OR, &[r, m])
+    }
+
     /// v_cmp_class (see `interp::fp_class`): does `mask` contain the class
     /// bit of the float in `x` (f32 in x.lo when ebits = 8, else the f64
     /// pair)? Classified from the sign, exponent and mantissa words.
@@ -1130,6 +1180,15 @@ impl Tr {
         if cmp.kind == CmpKind::Class32 {
             let zero = self.c(0);
             return self.fp_class_test(Pair { lo: a, hi: zero }, b, 8);
+        }
+        if cmp.kind == CmpKind::F16 {
+            let (x, y) = (self.half_as_f64(a), self.half_as_f64(b));
+            return self.compare64(cmp.cond, x, y);
+        }
+        if cmp.kind == CmpKind::Class16 {
+            let x = self.half_as_f32_class(a);
+            let zero = self.c(0);
+            return self.fp_class_test(Pair { lo: x, hi: zero }, b, 8);
         }
         let (t, f) = (self.b.constant_bool(true), self.b.constant_bool(false));
         if cmp.kind == CmpKind::F32 {

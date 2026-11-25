@@ -3507,7 +3507,7 @@ fn valu_from_amd_spec() {
     let lt_u = Compare::decode(0xE1).unwrap();
     assert!(lt_i.eval64(u64::MAX, 0) && !lt_u.eval64(u64::MAX, 0));
     assert!(lt_u.eval64(0x1_0000_0000, 0x1_0000_0001) && Compare::decode(0xB2).unwrap().cmpx);
-    assert!(Compare::decode(0xE8).is_none(), "no ninth u64 condition (0xA8 is v_cmp_class_f64)");
+    assert!(Compare::decode(0xA7).unwrap().cond == 7 && Compare::decode(0xE8).unwrap().kind != scarlett_gpu::interp::CmpKind::U64, "0xE8 is v_cmp_u_f16, not a ninth u64 condition");
 
     let mut code = vec![];
     for op in [vop3::V_SAD_U8, vop3::V_SAD_HI_U8, vop3::V_SAD_U16, vop3::V_SAD_U32, vop3::V_LERP_U8, vop3::V_MAD_U32_U16, vop3::V_MAD_I32_I16] {
@@ -3546,7 +3546,7 @@ fn int16_from_amd_spec() {
     let lt_u = Compare::decode(0xA9).unwrap();
     assert!(lt_i.eval(0x0000_FFFF, 0xFFFF_0001) && !lt_u.eval(0x0000_FFFF, 0xFFFF_0001), "-1 < 1 signed only");
     assert!(Compare::decode(0x99).unwrap().cmpx && Compare::decode(0xBE).unwrap().cmpx);
-    assert!(Compare::decode(0x8F).is_none() && Compare::decode(0xAF).is_none(), "class_f16 / nothing");
+    assert!(Compare::decode(0xAF).is_none() && Compare::decode(0xBF).is_none(), "empty slots");
     assert_eq!(vop3_16_3(vop3::V_MED3_I16, 0xFFFF, 5, 0x8000), Some(0xFFFF), "med(-1, 5, -32768)");
     assert_eq!(vop3_16_3(vop3::V_MED3_U16, 0xFFFF, 5, 0x8000), Some(0x8000));
     assert_eq!(vop3_16_3(vop3::V_MAD_U16, 0x1_0100, 0x100, 7), Some(7), "0x100 * 0x100 wraps");
@@ -3833,6 +3833,45 @@ fn wqm_quadmask_lshl_add_bfe64() {
     let mut w = Wave::new(WaveSize::W32, NV as usize);
     w.sgpr[1] = 64 << 16;
     assert!(interp::run(&[sop2e(sop2::S_BFE_U64, 2, 4, 1), ENDPGM], &mut w, 10).is_err(), "width 64");
+}
+
+/// f16 compares (all 16 conditions, cmp and cmpx) and class_f16 on the
+/// low halves: NaN, ±0, denormals, infinities by hand, then random halves
+/// (a NaN in 1 of 32) and SGPR specials.
+#[test]
+fn f16_compares() {
+    use scarlett_gpu::interp::{half_f64, Compare};
+    assert_eq!((half_f64(0x3C00), half_f64(0xC000), half_f64(0x0001)), (1.0, -2.0, 2f64.powi(-24)));
+    assert!(half_f64(0x7E00).is_nan() && half_f64(0xFC00) == f64::NEG_INFINITY);
+    let lt = Compare::decode(0xC9).unwrap();
+    assert!(lt.eval(0x0001, 0x0002) && !lt.eval(0x8000, 0x0000) && !lt.eval(0x7E00, 0x3C00));
+    assert!(Compare::decode(0xED).unwrap().eval(0x7C01, 0x7C01), "neq of NaNs");
+    assert!(Compare::decode(0xFF).unwrap().cmpx && Compare::decode(0xE8).unwrap().cond == 8);
+    assert!(Compare::decode(0x8F).unwrap().eval(0x0001, 1 << 7), "+denormal class");
+    assert_eq!(scarlett_gpu::rdna::decode(&[vopce(0xEE, v(1), 2)], 0).unwrap().mnemonic(), "v_cmp_nlt_f16");
+    let specials = [0x7C01u32, 0x7E00, 0xFC00, 0xBC00, 0x8001, 0x8000, 0x0000, 0x0001, 0x3C00, 0x7C00];
+    let mut code = vec![vop1e(vop1::V_MOV_B32, 6, int(0)), vop1e(vop1::V_MOV_B32, 7, int(0))];
+    for (k, base) in [0xC8u16, 0xE8].into_iter().enumerate() {
+        for cond in 0..8u16 {
+            code.push(vopce(base + cond, v(0), 1));
+            code.push(vop2e(vop2::V_ADD_CO_CI_U32, 6, v(6), 6));
+            code.extend([sop1e(sop1::S_MOV_B32, 4, LIT), specials[(cond as usize + k) % 10]]);
+            code.push(vopce(base + cond, 4, 2));
+            code.push(vop2e(vop2::V_ADD_CO_CI_U32, 7, v(7), 7));
+        }
+    }
+    for (k, x) in specials.iter().enumerate() {
+        code.extend([sop1e(sop1::S_MOV_B32, 4, LIT), *x]);
+        code.push(vopce(0x8F, 4, 3)); // class_f16 against random masks
+        code.push(vop2e(vop2::V_ADD_CO_CI_U32, 6, v(6), 6));
+        code.push(vopce(0xC9 + (k as u16 % 6), 4, 0));
+        code.push(vop2e(vop2::V_ADD_CO_CI_U32, 7, v(7), 7));
+    }
+    code.extend(vop3e(0xEA, 10, [v(1), v(2), 0])); // VOP3 form
+    code.push(vopce(0xD9, v(2), 3)); // v_cmpx_lt_f16
+    code.push(vop1e(vop1::V_MOV_B32, 5, int(1)));
+    code.push(ENDPGM);
+    check_all(&code);
 }
 
 /// s_bitreplicate_b64_b32 into SGPRs, VCC and EXEC (a lane mask built

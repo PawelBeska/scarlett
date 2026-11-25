@@ -2226,8 +2226,12 @@ impl Inst {
             use crate::interp::CmpKind;
             const F: [&str; 16] = ["f", "lt", "eq", "le", "gt", "lg", "ge", "o", "u", "nge", "nlg", "ngt", "nle", "neq", "nlt", "tru"];
             const I: [&str; 8] = ["f", "lt", "eq", "le", "gt", "ne", "ge", "t"];
-            if matches!(c.kind, CmpKind::Class32 | CmpKind::Class64) {
-                let ty = if c.kind == CmpKind::Class32 { "f32" } else { "f64" };
+            if matches!(c.kind, CmpKind::Class32 | CmpKind::Class64 | CmpKind::Class16) {
+                let ty = match c.kind {
+                    CmpKind::Class32 => "f32",
+                    CmpKind::Class64 => "f64",
+                    _ => "f16",
+                };
                 return format!("v_cmp{}_class_{ty}", if c.cmpx { "x" } else { "" });
             }
             let (cond, ty) = match c.kind {
@@ -2239,7 +2243,8 @@ impl Inst {
                 CmpKind::U64 => (I[c.cond as usize], "u64"),
                 CmpKind::I16 => (I[c.cond as usize], "i16"),
                 CmpKind::U16 => (I[c.cond as usize], "u16"),
-                CmpKind::Class32 | CmpKind::Class64 => unreachable!(),
+                CmpKind::F16 => (F[c.cond as usize], "f16"),
+                CmpKind::Class32 | CmpKind::Class64 | CmpKind::Class16 => unreachable!(),
             };
             return format!("v_cmp{}_{cond}_{ty}", if c.cmpx { "x" } else { "" });
         }

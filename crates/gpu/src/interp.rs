@@ -387,6 +387,9 @@ pub enum CmpKind {
     /// against the class mask in S1 (cond unused).
     Class32,
     Class64,
+    /// f16 compares on the low halves (all 16 conditions) and class_f16.
+    F16,
+    Class16,
 }
 
 impl Compare {
@@ -395,13 +398,19 @@ impl Compare {
             // AMD RDNA2 ISA specification: slots 8..15 of the i32 / i64
             // groups hold class_f32 / class_f64 (slot 8), the i16 / u16
             // conditions lt..ge (9..14) and class_f16 or nothing (15)
+            0x8F | 0x9F => (CmpKind::Class16, (op - 0x8F) & 16),
+            // f16: conditions 0..7 at 0xC8 (cmpx 0xD8), 8..15 at 0xE8 (cmpx 0xF8)
+            0xC8..=0xCF => (CmpKind::F16, op - 0xC8),
+            0xD8..=0xDF => (CmpKind::F16, op - 0xD8 + 16),
+            0xE8..=0xEF => (CmpKind::F16, op - 0xE8 + 8),
+            0xF8..=0xFF => (CmpKind::F16, op - 0xF8 + 24),
             0x88 | 0x98 => (CmpKind::Class32, (op - 0x88) & 16),
             0xA8 | 0xB8 => (CmpKind::Class64, (op - 0xA8) & 16),
             0x89..=0x8E => (CmpKind::I16, op - 0x88),
             0x99..=0x9E => (CmpKind::I16, op - 0x98 + 16),
             0xA9..=0xAE => (CmpKind::U16, op - 0xA8),
             0xB9..=0xBE => (CmpKind::U16, op - 0xB8 + 16),
-            0x8F | 0x9F | 0xAF | 0xBF => return None,
+            0xAF | 0xBF => return None,
             0..=31 => (CmpKind::F32, op),
             32..=63 => (CmpKind::F64, op - 32),
             128..=151 => (CmpKind::I32, op - 128),
@@ -412,7 +421,7 @@ impl Compare {
         };
         let cmpx = rel & 16 != 0;
         let cond = rel & 15;
-        if !matches!(kind, CmpKind::F32 | CmpKind::F64 | CmpKind::Class32 | CmpKind::Class64) && cond > 7 {
+        if !matches!(kind, CmpKind::F32 | CmpKind::F64 | CmpKind::F16 | CmpKind::Class32 | CmpKind::Class64 | CmpKind::Class16) && cond > 7 {
             return None;
         }
         Some(Compare { kind, cond, cmpx })
@@ -429,6 +438,8 @@ impl Compare {
             CmpKind::F32 => float_cond(self.cond, f32::from_bits(a) as f64, f32::from_bits(b) as f64),
             CmpKind::F64 => float_cond(self.cond, f64::from_bits(a as u64), f64::from_bits(b as u64)),
             CmpKind::Class32 => fp_class(a as u64, 8, 23) & b != 0,
+            CmpKind::Class16 => fp_class(a as u64 & 0xFFFF, 5, 10) & b != 0,
+            CmpKind::F16 => float_cond(self.cond, half_f64(a as u16), half_f64(b as u16)),
             CmpKind::I16 => int_cond(self.cond, (a as u16 as i16).cmp(&(b as u16 as i16))),
             CmpKind::U16 => int_cond(self.cond, (a as u16).cmp(&(b as u16))),
             _ => {
@@ -2117,6 +2128,19 @@ pub fn f32_to_f16(bits: u32, rtz: bool) -> Option<u16> {
         h += 1;
     }
     Some(s | h as u16)
+}
+
+/// The exact value of f16 bits as an f64 (denormals included; any NaN
+/// is a NaN): for the f16 compares, which test the raw values.
+pub fn half_f64(h: u16) -> f64 {
+    let s = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
+    let (e, m) = ((h >> 10 & 0x1F) as i32, (h & 0x3FF) as f64);
+    s * match e {
+        0 => m * 2f64.powi(-24),
+        31 if m == 0.0 => f64::INFINITY,
+        31 => f64::NAN,
+        _ => (1024.0 + m) * 2f64.powi(e - 25),
+    }
 }
 
 /// f16 bits -> f32 bits; None for NaN and f16 denormals (FLOAT_MODE).
