@@ -1160,6 +1160,29 @@ impl Tr {
                 let y = self.u(op::BITWISE_AND, &[b, m]);
                 self.u(op::I_MUL, &[x, y])
             }
+            vop2::V_MUL_HI_U32_U24 => {
+                let m = self.c(0xFF_FFFF);
+                let x = self.u(op::BITWISE_AND, &[a, m]);
+                let y = self.u(op::BITWISE_AND, &[b, m]);
+                return self.vop3_int(vop3::V_MUL_HI_U32, x, y, x);
+            }
+            vop2::V_MUL_I32_I24 | vop2::V_MUL_HI_I32_I24 => {
+                // sign-extend bit 23: shl 8, then arithmetic shr 8
+                let k8 = self.c(8);
+                let t = self.t.i32t;
+                let mut ext = |v: Id| {
+                    let sh = self.u(op::SHIFT_LEFT_LOGICAL, &[v, k8]);
+                    let si = self.as_i32(sh);
+                    let r = self.b.op(t, op::SHIFT_RIGHT_ARITHMETIC, &[si, k8]);
+                    self.bits_of(r)
+                };
+                let (x, y) = (ext(a), ext(b));
+                if opc == vop2::V_MUL_I32_I24 {
+                    self.u(op::I_MUL, &[x, y])
+                } else {
+                    return self.vop3_int(vop3::V_MUL_HI_I32, x, y, x);
+                }
+            }
             vop2::V_MIN_I32 => self.pick(op::S_LESS_THAN, a, b, true, true),
             vop2::V_MAX_I32 => self.pick(op::S_LESS_THAN, a, b, true, false),
             vop2::V_MIN_U32 => self.pick(op::U_LESS_THAN, a, b, false, true),

@@ -875,7 +875,14 @@ pub mod vop2 {
     pub const V_SUB_F32: u16 = 4;
     pub const V_SUBREV_F32: u16 = 5;
     pub const V_MUL_F32: u16 = 8;
+    /// 24-bit multiplies: only S0[23:0] and S1[23:0] are read (LLVM's
+    /// simplifyMul24 demands the low 24 bits), sign-extended for i24; lo =
+    /// product[31:0], hi = product[63:32] (`mul24_64_Pat` builds the
+    /// 64-bit product from the pair). Opcodes from `VOP2_Real_gfx6_gfx7_gfx10*`.
+    pub const V_MUL_I32_I24: u16 = 9;
+    pub const V_MUL_HI_I32_I24: u16 = 10;
     pub const V_MUL_U32_U24: u16 = 11;
+    pub const V_MUL_HI_U32_U24: u16 = 12;
     pub const V_MIN_F32: u16 = 15;
     pub const V_MAX_F32: u16 = 16;
     pub const V_MIN_I32: u16 = 17;
@@ -1947,6 +1954,21 @@ impl Inst {
     }
 
     pub fn mnemonic(&self) -> String {
+        // VOPC compares (also in VOP3 form, opcode < 0x100): every kind and
+        // condition `interp::Compare` decodes, named as LLVM's gfx10_asm_vopc.s
+        let vopc = self.format == Format::Vopc || (self.format == Format::Vop3 && self.opcode < 0x100);
+        if let Some(c) = vopc.then(|| crate::interp::Compare::decode(self.opcode)).flatten() {
+            use crate::interp::CmpKind;
+            const F: [&str; 16] = ["f", "lt", "eq", "le", "gt", "lg", "ge", "o", "u", "nge", "nlg", "ngt", "nle", "neq", "nlt", "tru"];
+            const I: [&str; 8] = ["f", "lt", "eq", "le", "gt", "ne", "ge", "t"];
+            let (cond, ty) = match c.kind {
+                CmpKind::F32 => (F[c.cond as usize], "f32"),
+                CmpKind::F64 => (F[c.cond as usize], "f64"),
+                CmpKind::I32 => (I[c.cond as usize], "i32"),
+                CmpKind::U32 => (I[c.cond as usize], "u32"),
+            };
+            return format!("v_cmp{}_{cond}_{ty}", if c.cmpx { "x" } else { "" });
+        }
         let known = match (self.format, self.opcode) {
             (Format::Sopp, sopp::S_NOP) => "s_nop",
             (Format::Sopp, sopp::S_ENDPGM) => "s_endpgm",
@@ -2173,6 +2195,9 @@ impl Inst {
             (Format::Vop1, vop1::V_FFBH_I32) => "v_ffbh_i32",
             (Format::Vop1, vop1::V_FFBL_B32) => "v_ffbl_b32",
             (Format::Vop2, vop2::V_MUL_U32_U24) => "v_mul_u32_u24",
+            (Format::Vop2, vop2::V_MUL_I32_I24) => "v_mul_i32_i24",
+            (Format::Vop2, vop2::V_MUL_HI_I32_I24) => "v_mul_hi_i32_i24",
+            (Format::Vop2, vop2::V_MUL_HI_U32_U24) => "v_mul_hi_u32_u24",
             (Format::Vop2, vop2::V_MIN_F32) => "v_min_f32",
             (Format::Vop2, vop2::V_MAX_F32) => "v_max_f32",
             (Format::Vop2, vop2::V_FMAC_F32) => "v_fmac_f32",

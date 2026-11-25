@@ -3301,6 +3301,27 @@ fn scalar_bit_ops_b64() {
     }
 }
 
+/// v_mul_i32_i24, v_mul_hi_i32_i24, v_mul_hi_u32_u24: high 8 bits of the
+/// operands ignored, bit 23 the sign for i24.
+#[test]
+fn mul24_lo_hi() {
+    use scarlett_gpu::interp::vop2_int;
+    let (mi, hi, hu) = (vop2::V_MUL_I32_I24, vop2::V_MUL_HI_I32_I24, vop2::V_MUL_HI_U32_U24);
+    assert_eq!(vop2_int(mi, 0xFF80_0000, 2), Some((-(1i32 << 24)) as u32), "-2^23 * 2");
+    assert_eq!(vop2_int(hi, 0x0080_0000, 0x0080_0000), Some(0x4000), "(-2^23)^2 = 2^46");
+    assert_eq!(vop2_int(hi, 0x0080_0000, 1), Some(u32::MAX), "negative product: hi all ones");
+    assert_eq!(vop2_int(hu, 0xFFFF_FFFF, 0xFFFF_FFFF), Some(0xFFFF), "(2^24-1)^2 >> 32");
+    assert_eq!(vop2e(vop2::V_MUL_HI_U32_U24, 5, v(1), 2), 0x180A_0501);
+    let mut code = vec![];
+    for (k, op) in [mi, hi, hu].into_iter().enumerate() {
+        code.push(vop2e(op, 2 + k as u16, v(0), 1));
+        code.push(vop2e(op, 5 + k as u16, 3, 0));
+    }
+    code.extend(vop3e(vop3::FROM_VOP2 + hi, 1, [v(1), int(-7), int(0)]));
+    code.push(ENDPGM);
+    check_all(&code);
+}
+
 /// s_bitreplicate_b64_b32 into SGPRs, VCC and EXEC (a lane mask built
 /// from its half, as ACO does).
 #[test]

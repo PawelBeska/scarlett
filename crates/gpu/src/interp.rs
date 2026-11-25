@@ -2092,6 +2092,12 @@ fn dpp_step(inst: &Inst, at: usize, w: &mut Wave, mem: &mut dyn Memory) -> Optio
 pub fn vop2_int(op: u16, a: u32, b: u32) -> Option<u32> {
     Some(match op {
         vop2::V_MUL_U32_U24 => (a & 0xFF_FFFF).wrapping_mul(b & 0xFF_FFFF),
+        vop2::V_MUL_HI_U32_U24 => (((a as u64 & 0xFF_FFFF) * (b as u64 & 0xFF_FFFF)) >> 32) as u32,
+        vop2::V_MUL_I32_I24 | vop2::V_MUL_HI_I32_I24 => {
+            let s = |x: u32| ((x << 8) as i32 >> 8) as i64;
+            let p = s(a) * s(b);
+            if op == vop2::V_MUL_I32_I24 { p as u32 } else { (p >> 32) as u32 }
+        }
         vop2::V_MIN_I32 => (a as i32).min(b as i32) as u32,
         vop2::V_MAX_I32 => (a as i32).max(b as i32) as u32,
         vop2::V_MIN_U32 => a.min(b),
