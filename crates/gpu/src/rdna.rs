@@ -1051,6 +1051,18 @@ pub mod vop3 {
     /// S1[15:0]; D[15:0] written, D[31:16] kept (GFX10, see V_CVT_F16_F32);
     /// the *rev shifts shift S1 by S0[3:0].
     pub const V_ADD_NC_U16: u16 = 0x303;
+    // 16-bit, from AMD's RDNA2 ISA specification (low halves, D[31:16]
+    // kept as the other GFX10 16-bit ops)
+    pub const V_ADD_NC_I16: u16 = 0x30D;
+    pub const V_SUB_NC_I16: u16 = 0x30E;
+    pub const V_MAD_U16: u16 = 0x340;
+    pub const V_MAD_I16: u16 = 0x35E;
+    pub const V_MIN3_I16: u16 = 0x352;
+    pub const V_MIN3_U16: u16 = 0x353;
+    pub const V_MAX3_I16: u16 = 0x355;
+    pub const V_MAX3_U16: u16 = 0x356;
+    pub const V_MED3_I16: u16 = 0x358;
+    pub const V_MED3_U16: u16 = 0x359;
     pub const V_SUB_NC_U16: u16 = 0x304;
     pub const V_MUL_LO_U16: u16 = 0x305;
     pub const V_LSHRREV_B16: u16 = 0x307;
@@ -2146,6 +2158,8 @@ impl Inst {
                 CmpKind::U32 => (I[c.cond as usize], "u32"),
                 CmpKind::I64 => (I[c.cond as usize], "i64"),
                 CmpKind::U64 => (I[c.cond as usize], "u64"),
+                CmpKind::I16 => (I[c.cond as usize], "i16"),
+                CmpKind::U16 => (I[c.cond as usize], "u16"),
             };
             return format!("v_cmp{}_{cond}_{ty}", if c.cmpx { "x" } else { "" });
         }
@@ -2355,6 +2369,16 @@ impl Inst {
             (Format::Vop3, vop3::V_MAD_U64_U32) => "v_mad_u64_u32",
             (Format::Vop3, vop3::V_XOR3_B32) => "v_xor3_b32",
             (Format::Vop3, vop3::V_BFM_B32) => "v_bfm_b32",
+            (Format::Vop3, vop3::V_ADD_NC_I16) => "v_add_nc_i16",
+            (Format::Vop3, vop3::V_SUB_NC_I16) => "v_sub_nc_i16",
+            (Format::Vop3, vop3::V_MAD_U16) => "v_mad_u16",
+            (Format::Vop3, vop3::V_MAD_I16) => "v_mad_i16",
+            (Format::Vop3, vop3::V_MIN3_I16) => "v_min3_i16",
+            (Format::Vop3, vop3::V_MIN3_U16) => "v_min3_u16",
+            (Format::Vop3, vop3::V_MAX3_I16) => "v_max3_i16",
+            (Format::Vop3, vop3::V_MAX3_U16) => "v_max3_u16",
+            (Format::Vop3, vop3::V_MED3_I16) => "v_med3_i16",
+            (Format::Vop3, vop3::V_MED3_U16) => "v_med3_u16",
             (Format::Vop2, vop2::V_XNOR_B32) => "v_xnor_b32",
             (Format::Vop1, vop1::V_SWAP_B32) => "v_swap_b32",
             (Format::Vop3, vop3::V_ADD_NC_I32) => "v_add_nc_i32",

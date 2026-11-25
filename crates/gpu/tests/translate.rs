@@ -3504,7 +3504,7 @@ fn valu_from_amd_spec() {
     let lt_u = Compare::decode(0xE1).unwrap();
     assert!(lt_i.eval64(u64::MAX, 0) && !lt_u.eval64(u64::MAX, 0));
     assert!(lt_u.eval64(0x1_0000_0000, 0x1_0000_0001) && Compare::decode(0xB2).unwrap().cmpx);
-    assert!(Compare::decode(0xA8).is_none(), "no ninth integer condition");
+    assert!(Compare::decode(0xE8).is_none(), "no ninth u64 condition (0xA8 is v_cmp_f_u16)");
 
     let mut code = vec![];
     for op in [vop3::V_SAD_U8, vop3::V_SAD_HI_U8, vop3::V_SAD_U16, vop3::V_SAD_U32, vop3::V_LERP_U8, vop3::V_MAD_U32_U16, vop3::V_MAD_I32_I16] {
@@ -3529,6 +3529,46 @@ fn valu_from_amd_spec() {
     }
     code.push(vopce(0xF4, int(-1), 4)); // v_cmpx_gt_u64 with an inline -1
     code.push(vop1e(vop1::V_MOV_B32, 3, int(1)));
+    code.push(ENDPGM);
+    check_all(&code);
+}
+
+/// 16-bit integer ops from AMD's RDNA2 ISA specification: the i16/u16
+/// compares (low halves; high halves differ from the low ones' sign) and
+/// v_add/sub_nc_i16, v_mad_u16/i16, v_min3/max3/med3_{i16,u16}.
+#[test]
+fn int16_from_amd_spec() {
+    use scarlett_gpu::interp::{vop3_16_3, Compare};
+    let lt_i = Compare::decode(0x89).unwrap();
+    let lt_u = Compare::decode(0xA9).unwrap();
+    assert!(lt_i.eval(0x0000_FFFF, 0xFFFF_0001) && !lt_u.eval(0x0000_FFFF, 0xFFFF_0001), "-1 < 1 signed only");
+    assert!(Compare::decode(0x99).unwrap().cmpx && Compare::decode(0xBF).unwrap().cmpx);
+    assert_eq!(vop3_16_3(vop3::V_MED3_I16, 0xFFFF, 5, 0x8000), Some(0xFFFF), "med(-1, 5, -32768)");
+    assert_eq!(vop3_16_3(vop3::V_MED3_U16, 0xFFFF, 5, 0x8000), Some(0x8000));
+    assert_eq!(vop3_16_3(vop3::V_MAD_U16, 0x1_0100, 0x100, 7), Some(7), "0x100 * 0x100 wraps");
+    assert_eq!(vop3_16_3(vop3::V_MIN3_I16, 3, 0x8001, 2), Some(0x8001));
+    let mut code = vec![];
+    for op in [vop3::V_MAD_U16, vop3::V_MAD_I16, vop3::V_MIN3_I16, vop3::V_MIN3_U16, vop3::V_MAX3_I16, vop3::V_MAX3_U16, vop3::V_MED3_I16, vop3::V_MED3_U16] {
+        code.extend(vop3e(op, 7, [v(0), v(1), v(2)]));
+        code.push(vop2e(vop2::V_XOR_B32, 3, v(7), 3));
+        code.push(vop2e(vop2::V_LSHLREV_B32, 3, int(3), 3));
+    }
+    code.extend(vop3e(vop3::V_ADD_NC_I16, 4, [v(0), 1, 0]));
+    code.extend(vop3e(vop3::V_SUB_NC_I16, 5, [v(1), int(-9), 0]));
+    code.push(vop1e(vop1::V_MOV_B32, 6, int(0)));
+    code.push(vop1e(vop1::V_MOV_B32, 7, int(0)));
+    for base in [0x88u16, 0xA8] {
+        for cond in 0..8 {
+            code.push(vopce(base + cond, v(0), 1));
+            code.push(vop2e(vop2::V_ADD_CO_CI_U32, 6, v(6), 6));
+            code.push(vopce(base + cond, v(1), 2));
+            code.push(vop2e(vop2::V_ADD_CO_CI_U32, 7, v(7), 7));
+        }
+    }
+    code.extend(vop3e(0x89, VCC, [v(0), int(-2), 0])); // VOP3 form
+    code.push(vop2e(vop2::V_ADD_CO_CI_U32, 6, v(6), 6));
+    code.push(vopce(0xBC, v(2), 0)); // v_cmpx_gt_u16
+    code.push(vop1e(vop1::V_MOV_B32, 2, int(5)));
     code.push(ENDPGM);
     check_all(&code);
 }

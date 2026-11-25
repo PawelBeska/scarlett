@@ -372,11 +372,20 @@ pub enum CmpKind {
     /// 64-bit integer compares on register pairs (VOPC e32 only).
     I64,
     U64,
+    /// 16-bit compares of the low halves.
+    I16,
+    U16,
 }
 
 impl Compare {
     pub fn decode(op: u16) -> Option<Self> {
         let (kind, rel) = match op {
+            // i16 / u16 sit in the condition slots 8..15 of the i32 / i64
+            // groups (AMD RDNA2 ISA specification)
+            0x88..=0x8F => (CmpKind::I16, op - 0x88),
+            0x98..=0x9F => (CmpKind::I16, op - 0x98 + 16),
+            0xA8..=0xAF => (CmpKind::U16, op - 0xA8),
+            0xB8..=0xBF => (CmpKind::U16, op - 0xB8 + 16),
             0..=31 => (CmpKind::F32, op),
             32..=63 => (CmpKind::F64, op - 32),
             128..=151 => (CmpKind::I32, op - 128),
@@ -403,6 +412,8 @@ impl Compare {
         match self.kind {
             CmpKind::F32 => float_cond(self.cond, f32::from_bits(a) as f64, f32::from_bits(b) as f64),
             CmpKind::F64 => float_cond(self.cond, f64::from_bits(a as u64), f64::from_bits(b as u64)),
+            CmpKind::I16 => int_cond(self.cond, (a as u16 as i16).cmp(&(b as u16 as i16))),
+            CmpKind::U16 => int_cond(self.cond, (a as u16).cmp(&(b as u16))),
             _ => {
                 let ord = if self.kind == CmpKind::I32 {
                     (a as i32).cmp(&(b as i32))
@@ -2319,6 +2330,25 @@ pub fn vop3_16(op: u16, a: u32, b: u32) -> Option<u16> {
         vop3::V_MAX_I16 => sa.max(sb) as u16,
         vop3::V_MIN_U16 => a.min(b),
         vop3::V_MIN_I16 => sa.min(sb) as u16,
+        vop3::V_ADD_NC_I16 => a.wrapping_add(b),
+        vop3::V_SUB_NC_I16 => a.wrapping_sub(b),
+        _ => return None,
+    })
+}
+
+/// Three-operand 16-bit VOP3 (AMD RDNA2 ISA specification): the low
+/// halves, low half of the result (the caller keeps D[31:16]).
+pub fn vop3_16_3(op: u16, a: u32, b: u32, c: u32) -> Option<u16> {
+    let (a, b, c) = (a as u16, b as u16, c as u16);
+    let (sa, sb, sc) = (a as i16, b as i16, c as i16);
+    Some(match op {
+        vop3::V_MAD_U16 | vop3::V_MAD_I16 => a.wrapping_mul(b).wrapping_add(c),
+        vop3::V_MIN3_U16 => a.min(b).min(c),
+        vop3::V_MIN3_I16 => sa.min(sb).min(sc) as u16,
+        vop3::V_MAX3_U16 => a.max(b).max(c),
+        vop3::V_MAX3_I16 => sa.max(sb).max(sc) as u16,
+        vop3::V_MED3_U16 => a.min(b).max(a.max(b).min(c)),
+        vop3::V_MED3_I16 => sa.min(sb).max(sa.max(sb).min(sc)) as u16,
         _ => return None,
     })
 }
@@ -2655,6 +2685,16 @@ fn vop3_step(c: &Ctx, w: &mut Wave) -> Result<(), ExecError> {
                 c.vgpr_mut(w, vdst + 1)?[l] = (r >> 32) as u32;
             }
             Ok(())
+        }
+        op if vop3_16_3(op, 0, 0, 0).is_some() => {
+            if abs != 0 || neg != 0 {
+                return Err(c.err("source modifiers on an integer operation"));
+            }
+            for_active(c, w, vdst, |w, l| {
+                let x = |i: usize| c.v32(w, src[i], l);
+                let r = vop3_16_3(op, x(0)?, x(1)?, x(2)?).unwrap();
+                Ok(c.v32(w, 256 + vdst as u16, l)? & 0xFFFF_0000 | r as u32)
+            })
         }
         op if vop3_16(op, 0, 0).is_some() => {
             if abs != 0 || neg != 0 {

@@ -1129,7 +1129,25 @@ impl Tr {
                 _ => t,
             }
         } else {
-            let signed = cmp.kind == CmpKind::I32;
+            let signed = matches!(cmp.kind, CmpKind::I32 | CmpKind::I16);
+            let (a, b) = if matches!(cmp.kind, CmpKind::I16 | CmpKind::U16) {
+                // the low halves, sign-extended for i16
+                let k16 = self.c(16);
+                let mut lo = |v: Id| {
+                    let t = self.u(op::SHIFT_LEFT_LOGICAL, &[v, k16]);
+                    if signed {
+                        let ti = self.as_i32(t);
+                        let it = self.t.i32t;
+                        let r = self.b.op(it, op::SHIFT_RIGHT_ARITHMETIC, &[ti, k16]);
+                        self.bits_of(r)
+                    } else {
+                        self.u(op::SHIFT_RIGHT_LOGICAL, &[t, k16])
+                    }
+                };
+                (lo(a), lo(b))
+            } else {
+                (a, b)
+            };
             let (x, y) = if signed { (self.as_i32(a), self.as_i32(b)) } else { (a, b) };
             let pick = |s_op: u16, u_op: u16| if signed { s_op } else { u_op };
             let o = match cmp.cond {
@@ -4135,7 +4153,17 @@ impl Tr {
             | vop3::V_MAX_U16
             | vop3::V_MAX_I16
             | vop3::V_MIN_U16
-            | vop3::V_MIN_I16 => {
+            | vop3::V_MIN_I16
+            | vop3::V_ADD_NC_I16
+            | vop3::V_SUB_NC_I16
+            | vop3::V_MAD_U16
+            | vop3::V_MAD_I16
+            | vop3::V_MIN3_I16
+            | vop3::V_MIN3_U16
+            | vop3::V_MAX3_I16
+            | vop3::V_MAX3_U16
+            | vop3::V_MED3_I16
+            | vop3::V_MED3_U16 => {
                 if neg != 0 {
                     return Err(self.err("neg on an integer operation"));
                 }
@@ -4148,11 +4176,41 @@ impl Tr {
                     let t = tr.u(op::SHIFT_LEFT_LOGICAL, &[v, k16]);
                     tr.u(if signed { op::SHIFT_RIGHT_ARITHMETIC } else { op::SHIFT_RIGHT_LOGICAL }, &[t, k16])
                 };
-                let signed = matches!(opc, vop3::V_ASHRREV_I16 | vop3::V_MAX_I16 | vop3::V_MIN_I16);
+                let signed = matches!(
+                    opc,
+                    vop3::V_ASHRREV_I16 | vop3::V_MAX_I16 | vop3::V_MIN_I16 | vop3::V_MIN3_I16 | vop3::V_MAX3_I16 | vop3::V_MED3_I16
+                );
                 let (a, b) = (lo(self, x, signed), lo(self, y, signed));
+                let three = crate::interp::vop3_16_3(opc, 0, 0, 0).is_some();
+                let z = if three {
+                    let z = self.vsrc(src[2], lit)?;
+                    lo(self, z, signed)
+                } else {
+                    a
+                };
+                let (cmp, sg) = if signed { (op::S_LESS_THAN, true) } else { (op::U_LESS_THAN, false) };
                 let k15 = self.c(15);
                 let r = match opc {
-                    vop3::V_ADD_NC_U16 => self.u(op::I_ADD, &[a, b]),
+                    vop3::V_ADD_NC_U16 | vop3::V_ADD_NC_I16 => self.u(op::I_ADD, &[a, b]),
+                    vop3::V_SUB_NC_I16 => self.u(op::I_SUB, &[a, b]),
+                    vop3::V_MAD_U16 | vop3::V_MAD_I16 => {
+                        let p = self.u(op::I_MUL, &[a, b]);
+                        self.u(op::I_ADD, &[p, z])
+                    }
+                    vop3::V_MIN3_I16 | vop3::V_MIN3_U16 => {
+                        let t = self.pick(cmp, a, b, sg, true);
+                        self.pick(cmp, t, z, sg, true)
+                    }
+                    vop3::V_MAX3_I16 | vop3::V_MAX3_U16 => {
+                        let t = self.pick(cmp, a, b, sg, false);
+                        self.pick(cmp, t, z, sg, false)
+                    }
+                    vop3::V_MED3_I16 | vop3::V_MED3_U16 => {
+                        let mn = self.pick(cmp, a, b, sg, true);
+                        let mx = self.pick(cmp, a, b, sg, false);
+                        let t = self.pick(cmp, mx, z, sg, true);
+                        self.pick(cmp, mn, t, sg, false)
+                    }
                     vop3::V_SUB_NC_U16 => self.u(op::I_SUB, &[a, b]),
                     vop3::V_MUL_LO_U16 => self.u(op::I_MUL, &[a, b]),
                     vop3::V_LSHLREV_B16 | vop3::V_LSHRREV_B16 | vop3::V_ASHRREV_I16 => {
