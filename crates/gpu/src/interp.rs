@@ -369,6 +369,9 @@ pub enum CmpKind {
     F64,
     I32,
     U32,
+    /// 64-bit integer compares on register pairs (VOPC e32 only).
+    I64,
+    U64,
 }
 
 impl Compare {
@@ -377,12 +380,14 @@ impl Compare {
             0..=31 => (CmpKind::F32, op),
             32..=63 => (CmpKind::F64, op - 32),
             128..=151 => (CmpKind::I32, op - 128),
+            160..=183 => (CmpKind::I64, op - 160),
             192..=215 => (CmpKind::U32, op - 192),
+            224..=247 => (CmpKind::U64, op - 224),
             _ => return None,
         };
         let cmpx = rel & 16 != 0;
         let cond = rel & 15;
-        if matches!(kind, CmpKind::I32 | CmpKind::U32) && cond > 7 {
+        if !matches!(kind, CmpKind::F32 | CmpKind::F64) && cond > 7 {
             return None;
         }
         Some(Compare { kind, cond, cmpx })
@@ -398,33 +403,51 @@ impl Compare {
         match self.kind {
             CmpKind::F32 => float_cond(self.cond, f32::from_bits(a) as f64, f32::from_bits(b) as f64),
             CmpKind::F64 => float_cond(self.cond, f64::from_bits(a as u64), f64::from_bits(b as u64)),
-            CmpKind::I32 | CmpKind::U32 => {
+            _ => {
                 let ord = if self.kind == CmpKind::I32 {
                     (a as i32).cmp(&(b as i32))
                 } else {
                     a.cmp(&b)
                 };
-                use std::cmp::Ordering::*;
-                match self.cond {
-                    0 => false,
-                    1 => ord == Less,
-                    2 => ord == Equal,
-                    3 => ord != Greater,
-                    4 => ord == Greater,
-                    5 => ord != Equal,
-                    6 => ord != Less,
-                    _ => true,
-                }
+                int_cond(self.cond, ord)
             }
         }
     }
 }
 
 impl Compare {
-    /// An f64 condition on two register pairs.
+    /// An f64 / i64 / u64 condition on two register pairs.
     pub fn eval64(&self, a: u64, b: u64) -> bool {
-        float_cond(self.cond, f64::from_bits(a), f64::from_bits(b))
+        match self.kind {
+            CmpKind::I64 => int_cond(self.cond, (a as i64).cmp(&(b as i64))),
+            CmpKind::U64 => int_cond(self.cond, a.cmp(&b)),
+            _ => float_cond(self.cond, f64::from_bits(a), f64::from_bits(b)),
+        }
     }
+
+    /// Operands are 64-bit register pairs.
+    pub fn wide(&self) -> bool {
+        matches!(self.kind, CmpKind::F64 | CmpKind::I64 | CmpKind::U64)
+    }
+}
+
+/// Integer conditions in opcode order: f, lt, eq, le, gt, ne, ge, t (AMD's
+/// RDNA2 ISA specification, also for the 64-bit kinds).
+fn int_cond(cond: u16, ord: std::cmp::Ordering) -> bool {
+    use std::cmp::Ordering::*;
+    match cond {
+        0 => false,
+        1 => ord == Less,
+        2 => ord == Equal,
+        3 => ord != Greater,
+        4 => ord == Greater,
+        5 => ord != Equal,
+        6 => ord != Less,
+        _ => true,
+    }
+}
+
+impl Compare {
 }
 
 /// Float condition `cond` (see `Compare::eval`); f32 operands widen to
@@ -708,7 +731,7 @@ fn step(inst: &Inst, at: usize, w: &mut Wave, mem: &mut dyn Memory) -> Result<()
         (&Fields::Vopc { src0, vsrc1 }, op) => {
             let cmp = Compare::decode(op).ok_or_else(|| c.err("opcode"))?;
             let b = 256 + vsrc1 as u16;
-            let m = if cmp.kind == CmpKind::F64 {
+            let m = if cmp.wide() {
                 compare_mask(w, |l| Ok(cmp.eval64(src64(&c, w, src0, l)?, src64(&c, w, b, l)?)))?
             } else {
                 compare_mask(w, |l| Ok(cmp.eval(c.v32(w, src0, l)?, c.v32(w, b, l)?)))?
@@ -1893,6 +1916,19 @@ fn vop1_step(c: &Ctx, w: &mut Wave, op: u16, vdst: u8, src0: u16) -> Result<(), 
         }),
         vop1::V_NOP => Ok(()),
         vop1::V_MOV_B32 => for_active(c, w, vdst, |w, l| c.v32(w, src0, l)),
+        vop1::V_SWAP_B32 => {
+            if src0 < 256 {
+                return Err(c.err("v_swap_b32 of a non-VGPR"));
+            }
+            for l in 0..w.size.lanes() {
+                if w.active(l) {
+                    let (x, y) = (c.v32(w, src0, l)?, c.v32(w, 256 + vdst as u16, l)?);
+                    c.vgpr_mut(w, vdst)?[l] = x;
+                    c.vgpr_mut(w, (src0 - 256) as u8)?[l] = y;
+                }
+            }
+            Ok(())
+        }
         vop1::V_CVT_F32_I32 => for_active(c, w, vdst, |w, l| {
             Ok((c.v32(w, src0, l)? as i32 as f32).to_bits())
         }),
@@ -2174,6 +2210,7 @@ pub fn vop2_int(op: u16, a: u32, b: u32) -> Option<u32> {
         vop2::V_AND_B32 => a & b,
         vop2::V_OR_B32 => a | b,
         vop2::V_XOR_B32 => a ^ b,
+        vop2::V_XNOR_B32 => !(a ^ b),
         vop2::V_ADD_NC_U32 => a.wrapping_add(b),
         vop2::V_SUB_NC_U32 => a.wrapping_sub(b),
         vop2::V_SUBREV_NC_U32 => b.wrapping_sub(a),
@@ -2295,6 +2332,24 @@ pub fn vop3_int(op: u16, a: u32, b: u32, c: u32) -> Option<u32> {
         vop3::V_AND_OR_B32 => (a & b) | c,
         vop3::V_OR3_B32 => a | b | c,
         vop3::V_XOR3_B32 => a ^ b ^ c,
+        // AMD RDNA2 ISA specification descriptions
+        vop3::V_ADD_NC_I32 => a.wrapping_add(b),
+        vop3::V_SUB_NC_I32 => a.wrapping_sub(b),
+        vop3::V_MAD_U32_U16 => (a & 0xFFFF).wrapping_mul(b & 0xFFFF).wrapping_add(c),
+        vop3::V_MAD_I32_I16 => ((a as u16 as i16 as i32).wrapping_mul(b as u16 as i16 as i32) as u32).wrapping_add(c),
+        vop3::V_SAD_U8 | vop3::V_SAD_HI_U8 => {
+            let sum: u32 = (0..4).map(|k| ((a >> (8 * k)) as u8).abs_diff((b >> (8 * k)) as u8) as u32).sum();
+            (if op == vop3::V_SAD_HI_U8 { sum << 16 } else { sum }).wrapping_add(c)
+        }
+        vop3::V_SAD_U16 => {
+            let sum: u32 = (0..2).map(|k| ((a >> (16 * k)) as u16).abs_diff((b >> (16 * k)) as u16) as u32).sum();
+            sum.wrapping_add(c)
+        }
+        vop3::V_SAD_U32 => a.abs_diff(b).wrapping_add(c),
+        vop3::V_LERP_U8 => (0..4).fold(0, |r, k| {
+            let byte = |x: u32| x >> (8 * k) & 0xFF;
+            r | (byte(a) + byte(b) + (byte(c) & 1)) >> 1 << (8 * k)
+        }),
         vop3::V_ADD_LSHL_U32 => a.wrapping_add(b) << (c & 31),
         vop3::V_BFM_B32 => (((1u64 << (a & 31)) as u32).wrapping_sub(1)) << (b & 31),
         vop3::V_BFE_U32 => (a >> (b & 31)) & ((1u32 << (c & 31)) - 1),
@@ -2477,8 +2532,8 @@ fn vop3_step(c: &Ctx, w: &mut Wave) -> Result<(), ExecError> {
         if cmp.cmpx {
             return Err(c.err("v_cmpx e64"));
         }
-        if cmp.kind == CmpKind::F64 {
-            return Err(c.err("f64 compare e64"));
+        if cmp.wide() {
+            return Err(c.err("64-bit compare e64"));
         }
         if (abs != 0 || neg != 0) && cmp.kind != CmpKind::F32 {
             return Err(c.err("source modifiers on an integer compare"));

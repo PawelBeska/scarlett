@@ -3487,6 +3487,52 @@ fn salu_from_amd_spec() {
     }
 }
 
+/// VALU from AMD's RDNA2 ISA specification: v_sad_*, v_lerp_u8,
+/// v_mad_u32_u16/i32_i16, v_add/sub_nc_i32, v_xnor_b32, v_swap_b32 and
+/// the i64/u64 compares (pairs equal in the high word, signs differing).
+#[test]
+fn valu_from_amd_spec() {
+    use scarlett_gpu::interp::{vop3_int, Compare};
+    assert_eq!(vop3_int(vop3::V_SAD_U8, 0x0110_FF00, 0x0201_00FF, 7), Some(7 + 1 + 15 + 255 + 255));
+    assert_eq!(vop3_int(vop3::V_SAD_HI_U8, 0x0000_0003, 0x0000_0001, 1), Some((2 << 16) + 1));
+    assert_eq!(vop3_int(vop3::V_SAD_U16, 0x0001_FFFF, 0x0003_0000, 0), Some(2 + 0xFFFF));
+    assert_eq!(vop3_int(vop3::V_SAD_U32, 3, 10, 5), Some(12));
+    assert_eq!(vop3_int(vop3::V_LERP_U8, 0x01_02_FF_00, 0x02_02_FF_01, 0x01_00_01_00), Some(0x02_02_FF_00));
+    assert_eq!(vop3_int(vop3::V_MAD_I32_I16, 0xAAAA_FFFF, 0x0000_0003, 10), Some(7), "-1 * 3 + 10");
+    assert_eq!(vop3_int(vop3::V_MAD_U32_U16, 0xAAAA_FFFF, 0x0000_0003, 10), Some(0xFFFF * 3 + 10));
+    let lt_i = Compare::decode(0xA1).unwrap();
+    let lt_u = Compare::decode(0xE1).unwrap();
+    assert!(lt_i.eval64(u64::MAX, 0) && !lt_u.eval64(u64::MAX, 0));
+    assert!(lt_u.eval64(0x1_0000_0000, 0x1_0000_0001) && Compare::decode(0xB2).unwrap().cmpx);
+    assert!(Compare::decode(0xA8).is_none(), "no ninth integer condition");
+
+    let mut code = vec![];
+    for op in [vop3::V_SAD_U8, vop3::V_SAD_HI_U8, vop3::V_SAD_U16, vop3::V_SAD_U32, vop3::V_LERP_U8, vop3::V_MAD_U32_U16, vop3::V_MAD_I32_I16] {
+        code.extend(vop3e(op, 7, [v(0), v(1), v(2)]));
+        code.push(vop2e(vop2::V_XOR_B32, 3, v(7), 3));
+    }
+    code.extend(vop3e(vop3::V_ADD_NC_I32, 4, [v(0), 1, 0]));
+    code.extend(vop3e(vop3::V_SUB_NC_I32, 5, [v(1), int(-9), 0]));
+    code.push(vop2e(vop2::V_XNOR_B32, 6, v(0), 1));
+    code.push(vop1e(vop1::V_SWAP_B32, 0, v(1)));
+    code.push(ENDPGM);
+    check_all(&code);
+    // 64-bit compares: A = v[0:1], B = v[2:3] and C = (v2, v1): same high word as A
+    let mut code = vec![vop1e(vop1::V_MOV_B32, 5, v(1)), vop1e(vop1::V_MOV_B32, 4, v(2)), vop1e(vop1::V_MOV_B32, 6, int(0)), vop1e(vop1::V_MOV_B32, 7, int(0))];
+    for base in [0xA0u16, 0xE0] {
+        for cond in 0..8 {
+            code.push(vopce(base + cond, v(0), 2));
+            code.push(vop2e(vop2::V_ADD_CO_CI_U32, 6, v(6), 6));
+            code.push(vopce(base + cond, v(0), 4));
+            code.push(vop2e(vop2::V_ADD_CO_CI_U32, 7, v(7), 7));
+        }
+    }
+    code.push(vopce(0xF4, int(-1), 4)); // v_cmpx_gt_u64 with an inline -1
+    code.push(vop1e(vop1::V_MOV_B32, 3, int(1)));
+    code.push(ENDPGM);
+    check_all(&code);
+}
+
 /// s_bitreplicate_b64_b32 into SGPRs, VCC and EXEC (a lane mask built
 /// from its half, as ACO does).
 #[test]

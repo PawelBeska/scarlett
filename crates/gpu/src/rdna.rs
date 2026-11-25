@@ -885,6 +885,8 @@ pub mod vop1 {
     pub const V_CVT_F32_F16: u16 = 11;
     pub const V_NOP: u16 = 0;
     pub const V_MOV_B32: u16 = 1;
+    /// Swap D and S0 (both VGPRs) in active lanes (AMD RDNA2 ISA spec).
+    pub const V_SWAP_B32: u16 = 0x65;
     pub const V_READFIRSTLANE_B32: u16 = 2;
     pub const V_CVT_F32_I32: u16 = 5;
     pub const V_CVT_F32_U32: u16 = 6;
@@ -977,6 +979,8 @@ pub mod vop2 {
     pub const V_AND_B32: u16 = 27;
     pub const V_OR_B32: u16 = 28;
     pub const V_XOR_B32: u16 = 29;
+    /// !(S0 ^ S1) (AMD RDNA2 ISA specification).
+    pub const V_XNOR_B32: u16 = 0x1E;
     pub const V_ADD_NC_U32: u16 = 37;
     pub const V_SUB_NC_U32: u16 = 38;
     pub const V_SUBREV_NC_U32: u16 = 39;
@@ -1073,6 +1077,21 @@ pub mod vop3 {
     /// |S0 byte - S1 byte| (NIR `msad_4x8` with the reference as its src0,
     /// which ACO swaps into S1; VOP3 0x171).
     pub const V_MSAD_U8: u16 = 0x171;
+    // From AMD's machine-readable RDNA2 ISA specification:
+    /// D = S0 + S1 / S0 - S1, wrapping (no carry; clamp refused).
+    pub const V_ADD_NC_I32: u16 = 0x37F;
+    pub const V_SUB_NC_I32: u16 = 0x376;
+    /// S0[15:0] * S1[15:0] (unsigned / signed) + S2, 32-bit.
+    pub const V_MAD_U32_U16: u16 = 0x373;
+    pub const V_MAD_I32_I16: u16 = 0x375;
+    /// Sums of absolute differences of bytes / halves / words plus S2;
+    /// sad_hi_u8 shifts the sum left by 16 first.
+    pub const V_SAD_U8: u16 = 0x15A;
+    pub const V_SAD_HI_U8: u16 = 0x15B;
+    pub const V_SAD_U16: u16 = 0x15C;
+    pub const V_SAD_U32: u16 = 0x15D;
+    /// Per byte (S0 + S1 + (S2 & 1)) >> 1.
+    pub const V_LERP_U8: u16 = 0x14D;
     pub const V_ADD_CO_U32: u16 = 783;
     /// D[63:0] = S1[63:0] shifted by S0[5:0] (LLVM `clshl_rev_64` etc.;
     /// `gfx10_asm_vop3.s`: `v_lshlrev_b64 v[5:6], v1, v[2:3]` = 0xD6FF0005).
@@ -2125,6 +2144,8 @@ impl Inst {
                 CmpKind::F64 => (F[c.cond as usize], "f64"),
                 CmpKind::I32 => (I[c.cond as usize], "i32"),
                 CmpKind::U32 => (I[c.cond as usize], "u32"),
+                CmpKind::I64 => (I[c.cond as usize], "i64"),
+                CmpKind::U64 => (I[c.cond as usize], "u64"),
             };
             return format!("v_cmp{}_{cond}_{ty}", if c.cmpx { "x" } else { "" });
         }
@@ -2334,6 +2355,17 @@ impl Inst {
             (Format::Vop3, vop3::V_MAD_U64_U32) => "v_mad_u64_u32",
             (Format::Vop3, vop3::V_XOR3_B32) => "v_xor3_b32",
             (Format::Vop3, vop3::V_BFM_B32) => "v_bfm_b32",
+            (Format::Vop2, vop2::V_XNOR_B32) => "v_xnor_b32",
+            (Format::Vop1, vop1::V_SWAP_B32) => "v_swap_b32",
+            (Format::Vop3, vop3::V_ADD_NC_I32) => "v_add_nc_i32",
+            (Format::Vop3, vop3::V_SUB_NC_I32) => "v_sub_nc_i32",
+            (Format::Vop3, vop3::V_MAD_U32_U16) => "v_mad_u32_u16",
+            (Format::Vop3, vop3::V_MAD_I32_I16) => "v_mad_i32_i16",
+            (Format::Vop3, vop3::V_SAD_U8) => "v_sad_u8",
+            (Format::Vop3, vop3::V_SAD_HI_U8) => "v_sad_hi_u8",
+            (Format::Vop3, vop3::V_SAD_U16) => "v_sad_u16",
+            (Format::Vop3, vop3::V_SAD_U32) => "v_sad_u32",
+            (Format::Vop3, vop3::V_LERP_U8) => "v_lerp_u8",
             (Format::Vop3, vop3::V_LDEXP_F32) => "v_ldexp_f32",
             (Format::Vop3, vop3::V_MIN3_F32) => "v_min3_f32",
             (Format::Vop3, vop3::V_MAX3_F32) => "v_max3_f32",

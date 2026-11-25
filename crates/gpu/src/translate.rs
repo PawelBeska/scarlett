@@ -898,6 +898,31 @@ impl Tr {
         Pair { hi: self.select_u(neg, nh, fh), lo: self.select_u(neg, nl, p.lo) }
     }
 
+    /// i64 / u64 VOPC condition `cond` on register pairs: the high words
+    /// decide (signed for i64) unless equal, then the low words unsigned.
+    fn compare_int64(&mut self, cond: u16, a: Pair, b: Pair, signed: bool) -> Id {
+        let (t, f) = (self.b.constant_bool(true), self.b.constant_bool(false));
+        let (ah, bh) = if signed { (self.as_i32(a.hi), self.as_i32(b.hi)) } else { (a.hi, b.hi) };
+        let hlt = self.bl(if signed { op::S_LESS_THAN } else { op::U_LESS_THAN }, &[ah, bh]);
+        let heq = self.bl(op::I_EQUAL, &[a.hi, b.hi]);
+        let llt = self.bl(op::U_LESS_THAN, &[a.lo, b.lo]);
+        let leq = self.bl(op::I_EQUAL, &[a.lo, b.lo]);
+        let x = self.and_b(heq, llt);
+        let lt = self.bl(op::LOGICAL_OR, &[hlt, x]);
+        let eq = self.and_b(heq, leq);
+        let le = self.bl(op::LOGICAL_OR, &[lt, eq]);
+        match cond {
+            0 => f,
+            1 => lt,
+            2 => eq,
+            3 => le,
+            4 => self.not_b(le),
+            5 => self.not_b(eq),
+            6 => self.not_b(lt),
+            _ => t,
+        }
+    }
+
     /// f64 VOPC condition `cond` on bit patterns (no Float64 needed):
     /// NaN from the exponent and mantissa, equality with -0 == +0, and
     /// order through the usual sign-magnitude to unsigned key.
@@ -1205,6 +1230,10 @@ impl Tr {
             vop2::V_AND_B32 => self.u(op::BITWISE_AND, &[a, b]),
             vop2::V_OR_B32 => self.u(op::BITWISE_OR, &[a, b]),
             vop2::V_XOR_B32 => self.u(op::BITWISE_XOR, &[a, b]),
+            vop2::V_XNOR_B32 => {
+                let x = self.u(op::BITWISE_XOR, &[a, b]);
+                self.u(op::NOT, &[x])
+            }
             vop2::V_ADD_NC_U32 => self.u(op::I_ADD, &[a, b]),
             vop2::V_SUB_NC_U32 => self.u(op::I_SUB, &[a, b]),
             vop2::V_SUBREV_NC_U32 => self.u(op::I_SUB, &[b, a]),
@@ -1292,6 +1321,72 @@ impl Tr {
             vop3::V_XOR3_B32 => {
                 let x = self.u(op::BITWISE_XOR, &[a, b]);
                 self.u(op::BITWISE_XOR, &[x, c3])
+            }
+            vop3::V_ADD_NC_I32 => self.u(op::I_ADD, &[a, b]),
+            vop3::V_SUB_NC_I32 => self.u(op::I_SUB, &[a, b]),
+            vop3::V_MAD_U32_U16 | vop3::V_MAD_I32_I16 => {
+                let half = |tr: &mut Self, v: Id| {
+                    let k16 = tr.c(16);
+                    let sh = tr.u(op::SHIFT_LEFT_LOGICAL, &[v, k16]);
+                    if opc == vop3::V_MAD_I32_I16 {
+                        let si = tr.as_i32(sh);
+                        let t = tr.t.i32t;
+                        let r = tr.b.op(t, op::SHIFT_RIGHT_ARITHMETIC, &[si, k16]);
+                        tr.bits_of(r)
+                    } else {
+                        tr.u(op::SHIFT_RIGHT_LOGICAL, &[sh, k16])
+                    }
+                };
+                let (x, y) = (half(self, a), half(self, b));
+                let p = self.u(op::I_MUL, &[x, y]);
+                self.u(op::I_ADD, &[p, c3])
+            }
+            vop3::V_SAD_U8 | vop3::V_SAD_HI_U8 | vop3::V_SAD_U16 | vop3::V_SAD_U32 => {
+                let (n, w) = match opc {
+                    vop3::V_SAD_U16 => (2, 16),
+                    vop3::V_SAD_U32 => (1, 32),
+                    _ => (4, 8),
+                };
+                let mut sum = self.c(0);
+                for k in 0..n {
+                    let (x, y) = if w == 32 {
+                        (a, b)
+                    } else {
+                        let (sh, m) = (self.c(w * k), self.c((1u32 << w) - 1));
+                        let xs = self.u(op::SHIFT_RIGHT_LOGICAL, &[a, sh]);
+                        let ys = self.u(op::SHIFT_RIGHT_LOGICAL, &[b, sh]);
+                        (self.u(op::BITWISE_AND, &[xs, m]), self.u(op::BITWISE_AND, &[ys, m]))
+                    };
+                    let lt = self.bl(op::U_LESS_THAN, &[x, y]);
+                    let d1 = self.u(op::I_SUB, &[x, y]);
+                    let d2 = self.u(op::I_SUB, &[y, x]);
+                    let d = self.select_u(lt, d2, d1);
+                    sum = self.u(op::I_ADD, &[sum, d]);
+                }
+                if opc == vop3::V_SAD_HI_U8 {
+                    let k16 = self.c(16);
+                    sum = self.u(op::SHIFT_LEFT_LOGICAL, &[sum, k16]);
+                }
+                self.u(op::I_ADD, &[sum, c3])
+            }
+            vop3::V_LERP_U8 => {
+                let (m, one) = (self.c(0xFF), self.c(1));
+                let mut r = self.c(0);
+                for k in 0..4 {
+                    let sh = self.c(8 * k);
+                    let byte = |tr: &mut Self, v: Id| {
+                        let x = tr.u(op::SHIFT_RIGHT_LOGICAL, &[v, sh]);
+                        tr.u(op::BITWISE_AND, &[x, m])
+                    };
+                    let (x, y, z) = (byte(self, a), byte(self, b), byte(self, c3));
+                    let rnd = self.u(op::BITWISE_AND, &[z, one]);
+                    let s1 = self.u(op::I_ADD, &[x, y]);
+                    let s2 = self.u(op::I_ADD, &[s1, rnd]);
+                    let avg = self.u(op::SHIFT_RIGHT_LOGICAL, &[s2, one]);
+                    let p = self.u(op::SHIFT_LEFT_LOGICAL, &[avg, sh]);
+                    r = self.u(op::BITWISE_OR, &[r, p]);
+                }
+                r
             }
             vop3::V_ADD_LSHL_U32 => {
                 let x = self.u(op::I_ADD, &[a, b]);
@@ -1881,10 +1976,13 @@ impl Tr {
             }
             (&Fields::Vopc { src0, vsrc1 }, _, opc) => {
                 let cmp = crate::interp::Compare::decode(opc).ok_or_else(|| self.err("opcode"))?;
-                let cond = if cmp.kind == crate::interp::CmpKind::F64 {
+                let cond = if cmp.wide() {
                     let a = self.src64(src0, lit)?;
                     let b = self.src64(256 + vsrc1 as u16, lit)?;
-                    self.compare64(cmp.cond, a, b)
+                    match cmp.kind {
+                        crate::interp::CmpKind::F64 => self.compare64(cmp.cond, a, b),
+                        k => self.compare_int64(cmp.cond, a, b, k == crate::interp::CmpKind::I64),
+                    }
                 } else {
                     let a = self.vsrc(src0, lit)?;
                     let b = self.vsrc(256 + vsrc1 as u16, lit)?;
@@ -3553,6 +3651,15 @@ impl Tr {
                 self.set_vgpr(vdst, r)
             }
             vop1::V_NOP => Ok(()),
+            vop1::V_SWAP_B32 => {
+                if src0 < 256 {
+                    return Err(self.err("v_swap_b32 of a non-VGPR"));
+                }
+                let x = self.vsrc(src0, lit)?;
+                let y = self.vsrc(256 + vdst as u16, 0)?;
+                self.set_vgpr(vdst, x)?;
+                self.set_vgpr((src0 - 256) as u8, y)
+            }
             vop1::V_MOV_B32 => {
                 let a = self.vsrc(src0, lit)?;
                 self.set_vgpr(vdst, a)
@@ -3833,8 +3940,8 @@ impl Tr {
             if cmp.cmpx {
                 return Err(self.err("v_cmpx e64"));
             }
-            if cmp.kind == crate::interp::CmpKind::F64 {
-                return Err(self.err("f64 compare e64"));
+            if cmp.wide() {
+                return Err(self.err("64-bit compare e64"));
             }
             if (abs != 0 || neg != 0) && cmp.kind != crate::interp::CmpKind::F32 {
                 return Err(self.err("source modifiers on an integer compare"));
@@ -3981,6 +4088,15 @@ impl Tr {
             | vop3::V_XOR3_B32
             | vop3::V_BFM_B32
             | vop3::V_ADD_LSHL_U32
+            | vop3::V_ADD_NC_I32
+            | vop3::V_SUB_NC_I32
+            | vop3::V_MAD_U32_U16
+            | vop3::V_MAD_I32_I16
+            | vop3::V_SAD_U8
+            | vop3::V_SAD_HI_U8
+            | vop3::V_SAD_U16
+            | vop3::V_SAD_U32
+            | vop3::V_LERP_U8
             | vop3::V_MUL_HI_U32
             | vop3::V_MUL_LO_I32
             | vop3::V_MUL_HI_I32
