@@ -1,0 +1,9 @@
+[package]
+name = "scarlett-gpu"
+description = "GPU front end: PM4 command streams, register state, draw/dispatch capture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+log.workspace = true

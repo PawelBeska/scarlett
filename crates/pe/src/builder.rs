@@ -43,6 +43,8 @@ pub struct PeBuilder {
     dll: bool,
     with_relocs: bool,
     entry_offset: u32,
+    tls_dir: Option<u32>,
+    extra_dirs: Vec<(usize, u32, u32)>,
 }
 
 impl PeBuilder {
@@ -56,6 +58,8 @@ impl PeBuilder {
             dll: false,
             with_relocs: true,
             entry_offset: 0,
+            tls_dir: None,
+            extra_dirs: Vec::new(),
         }
     }
 
@@ -101,6 +105,21 @@ impl PeBuilder {
         let va = self.image_base + target_rva as u64;
         self.data[data_offset as usize..end].copy_from_slice(&va.to_le_bytes());
         self.data_relocs.push(data_offset);
+        self
+    }
+
+    /// Point the TLS data directory at a 40-byte `IMAGE_TLS_DIRECTORY64`
+    /// the caller laid out in .data at `data_offset` (use [`Self::data_pointer`]
+    /// for its VA fields so they get relocated).
+    pub fn tls_directory(mut self, data_offset: u32) -> Self {
+        self.tls_dir = Some(data_offset);
+        self
+    }
+
+    /// Set data directory `index` to (`rva`, `size`), e.g. the exception
+    /// directory (3) over a `RUNTIME_FUNCTION` table placed in .data.
+    pub fn directory(mut self, index: usize, rva: u32, size: u32) -> Self {
+        self.extra_dirs.push((index, rva, size));
         self
     }
 
@@ -285,7 +304,17 @@ impl PeBuilder {
         file[opt + 80..opt + 88].copy_from_slice(&0x1000u64.to_le_bytes());
         put32(&mut file, opt + 108, 16);
         let dd = |i: usize| opt + 112 + i * 8;
-        for (i, (rva, size)) in [(0, export_dir), (1, import_dir), (5, reloc_dir)] {
+        let tls_dir = self.tls_dir.map_or((0, 0), |o| (DATA_RVA + o, 40));
+        for (i, (rva, size)) in [
+            (0, export_dir),
+            (1, import_dir),
+            (5, reloc_dir),
+            (9, tls_dir),
+        ] {
+            put32(&mut file, dd(i), rva);
+            put32(&mut file, dd(i) + 4, size);
+        }
+        for &(i, rva, size) in &self.extra_dirs {
             put32(&mut file, dd(i), rva);
             put32(&mut file, dd(i) + 4, size);
         }

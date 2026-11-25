@@ -16,22 +16,57 @@
 //! unimplemented call. r10/r11 are volatile in Win64, so clobbering them is
 //! legal at a call boundary.
 //!
-//! Limitation (intentional for now): floating-point arguments passed in
-//! xmm0-3 and float/vector return values are not forwarded.
+//! Floating-point arguments (xmm0-3, then the stack) are read with
+//! [`Call::arg_f64`] / [`Call::arg_f32`]; a handler returning a float or
+//! vector sets it with [`Call::ret_f64`] / [`Call::ret_f32`] /
+//! [`Call::ret_xmm`] and returns any integer (rax is then don't-care).
 
 pub mod builtins;
 #[cfg(target_arch = "x86_64")]
+pub mod com;
+#[cfg(target_arch = "x86_64")]
+pub mod enter;
+#[cfg(target_arch = "x86_64")]
+pub mod file;
+pub mod guest;
+#[cfg(target_arch = "x86_64")]
+pub mod memory;
+#[cfg(target_arch = "x86_64")]
+pub mod module;
+#[cfg(target_arch = "x86_64")]
+pub mod object;
+pub mod policy;
+#[cfg(target_arch = "x86_64")]
+pub mod seh;
+#[cfg(target_arch = "x86_64")]
+pub mod sync;
+#[cfg(target_arch = "x86_64")]
+pub mod teb;
+#[cfg(target_arch = "x86_64")]
+pub mod threading;
+#[cfg(target_arch = "x86_64")]
+pub mod time;
+#[cfg(target_arch = "x86_64")]
 pub mod trampoline;
+pub mod vfs;
+#[cfg(target_arch = "x86_64")]
+pub mod xgameruntime;
 
 use scarlett_pe::ImportName;
+use std::cell::Cell;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
 /// Arguments of one guest call, in Win64 order.
 pub struct Call {
     regs: [u64; 4],
+    xmm: [[u64; 2]; 4],
     stack: *const u64,
+    xmm_ret: Cell<[u64; 2]>,
+    /// Full trampoline frame when called from guest code; null in tests.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) frame: *const trampoline::Frame,
 }
 
 impl Call {
@@ -39,7 +74,70 @@ impl Call {
     /// `stack` must point at the caller's 5th argument slot, valid for as
     /// many reads as the handler performs via [`Call::arg`].
     pub unsafe fn new(regs: [u64; 4], stack: *const u64) -> Self {
-        Call { regs, stack }
+        unsafe { Self::with_xmm(regs, [[0; 2]; 4], stack) }
+    }
+
+    /// Like [`Call::new`], with the caller's xmm0-3.
+    ///
+    /// # Safety
+    /// As [`Call::new`].
+    pub unsafe fn with_xmm(regs: [u64; 4], xmm: [[u64; 2]; 4], stack: *const u64) -> Self {
+        Call {
+            regs,
+            xmm,
+            stack,
+            xmm_ret: Cell::new([0; 2]),
+            #[cfg(target_arch = "x86_64")]
+            frame: std::ptr::null(),
+        }
+    }
+
+    /// Raw 64 bits of argument `i` as passed in its float position: the low
+    /// half of xmm`i` for `i < 4`, else the stack slot.
+    fn float_bits(&self, i: usize) -> u64 {
+        if i < 4 {
+            self.xmm[i][0]
+        } else {
+            self.arg(i)
+        }
+    }
+
+    /// `double` argument `i`.
+    pub fn arg_f64(&self, i: usize) -> f64 {
+        f64::from_bits(self.float_bits(i))
+    }
+
+    /// `float` argument `i` (low 32 bits of its slot).
+    pub fn arg_f32(&self, i: usize) -> f32 {
+        f32::from_bits(self.float_bits(i) as u32)
+    }
+
+    /// Return a `double` in xmm0.
+    pub fn ret_f64(&self, v: f64) {
+        self.xmm_ret.set([v.to_bits(), 0]);
+    }
+
+    /// Return a `float` in xmm0.
+    pub fn ret_f32(&self, v: f32) {
+        self.xmm_ret.set([v.to_bits() as u64, 0]);
+    }
+
+    /// Return a full 128-bit vector (`__m128`, `XMVECTOR`) in xmm0.
+    pub fn ret_xmm(&self, lo: u64, hi: u64) {
+        self.xmm_ret.set([lo, hi]);
+    }
+
+    /// The caller's register state at the call (callee-saved registers,
+    /// return address, stack pointer), when called from guest code.
+    #[cfg(target_arch = "x86_64")]
+    pub fn frame(&self) -> Option<&trampoline::Frame> {
+        // SAFETY: set by the trampoline to its live frame for this call.
+        unsafe { self.frame.as_ref() }
+    }
+
+    /// What the handler asked to leave in xmm0.
+    pub fn xmm_ret(&self) -> [u64; 2] {
+        self.xmm_ret.get()
     }
 
     /// Integer/pointer argument `i` (0-based).
@@ -61,7 +159,7 @@ impl Call {
 pub type Handler = fn(&Call) -> u64;
 
 /// Name → handler table, filled before loading an image.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Registry {
     by_name: HashMap<(String, String), Handler>,
     by_ordinal: HashMap<(String, u16), Handler>,
@@ -98,6 +196,13 @@ impl Registry {
         }
     }
 
+    /// Does any handler exist under this DLL name?
+    pub fn has_dll(&self, dll: &str) -> bool {
+        let dll = normalize_dll(dll);
+        self.by_name.keys().any(|(d, _)| *d == dll)
+            || self.by_ordinal.keys().any(|(d, _)| *d == dll)
+    }
+
     pub fn len(&self) -> usize {
         self.by_name.len() + self.by_ordinal.len()
     }
@@ -105,6 +210,24 @@ impl Registry {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+}
+
+/// Register every HLE module under each of `dlls`. Games import the same
+/// functions through many names (kernel32, kernelbase, kernelx, API sets
+/// like `api-ms-win-core-synch-l1-2-0`), so callers usually pass the image's
+/// whole import list.
+#[cfg(target_arch = "x86_64")]
+pub fn register_all(reg: &mut Registry, dlls: &[&str]) {
+    builtins::register_basic(reg, dlls);
+    threading::register_threading(reg, dlls);
+    memory::register_memory(reg, dlls);
+    sync::register_sync(reg, dlls);
+    time::register_time(reg, dlls);
+    object::register_objects(reg, dlls);
+    file::register_files(reg, dlls);
+    module::register_modules(reg, dlls);
+    seh::register_seh(reg, dlls);
+    xgameruntime::register_xgameruntime(reg);
 }
 
 /// One row of the global thunk table.
@@ -116,13 +239,17 @@ pub struct ThunkEntry {
 }
 
 static THUNKS: RwLock<Vec<ThunkEntry>> = RwLock::new(Vec::new());
-static STRICT: AtomicBool = AtomicBool::new(false);
 
-/// In strict mode an unimplemented import aborts the process instead of
-/// returning 0. Useful once basic boot works, to find the next missing API.
+/// Kept for callers of the old flag: `true` selects the `stop` policy.
 pub fn set_strict(strict: bool) {
-    STRICT.store(strict, Ordering::Relaxed);
+    policy::set_unimplemented_policy(if strict {
+        policy::Unimplemented::Stop
+    } else {
+        policy::Unimplemented::Log
+    });
 }
+
+pub use policy::{set_unimplemented_policy, unimplemented_policy, Unimplemented};
 
 /// Add a thunk-table entry and return its id.
 pub fn add_thunk(dll: &str, name: &ImportName, handler: Option<Handler>) -> u64 {
@@ -173,22 +300,43 @@ pub fn dispatch(id: u64, call: &Call) -> u64 {
             }
         },
         None => {
-            if STRICT.load(Ordering::Relaxed) {
-                log::error!(
-                    "HLE: unimplemented {dll}!{name}(rcx={:#x}, rdx={:#x}, r8={:#x}, r9={:#x}) [strict]",
-                    call.arg(0), call.arg(1), call.arg(2), call.arg(3)
+            let p = policy::unimplemented_policy();
+            if p == Unimplemented::Stop {
+                eprintln!(
+                    "HLE: unimplemented {dll}!{name} called from {} \
+                     (rcx={:#x}, rdx={:#x}, r8={:#x}, r9={:#x}) [stop]",
+                    caller_location(call),
+                    call.arg(0),
+                    call.arg(1),
+                    call.arg(2),
+                    call.arg(3)
                 );
-                std::process::abort();
+                std::process::exit(policy::STOP_EXIT_CODE);
             }
+            let ret = policy::unimplemented_return(p, &dll, &name);
             if first {
                 log::warn!(
-                    "HLE: unimplemented {dll}!{name}(rcx={:#x}, rdx={:#x}, r8={:#x}, r9={:#x}) -> 0",
+                    "HLE: unimplemented {dll}!{name}(rcx={:#x}, rdx={:#x}, r8={:#x}, r9={:#x}) -> {ret:#x}",
                     call.arg(0), call.arg(1), call.arg(2), call.arg(3)
                 );
             }
-            0
+            ret
         }
     }
+}
+
+/// The caller's return address as `module+0xRVA`, or a bare address.
+fn caller_location(call: &Call) -> String {
+    #[cfg(target_arch = "x86_64")]
+    if let Some(f) = call.frame() {
+        let rip = f.caller_rip;
+        return match module::guest_containing(rip) {
+            Some(m) => format!("{}+{:#x}", m.name, rip - m.base),
+            None => format!("{rip:#x}"),
+        };
+    }
+    let _ = call;
+    "<unknown caller>".into()
 }
 
 /// Encode the 23-byte thunk for `id` that jumps to `target`.
@@ -242,6 +390,26 @@ mod tests {
         assert_eq!(dispatch(id, &c), 0);
         let stats = thunk_stats();
         assert_eq!(stats[id as usize].3, 2);
+    }
+
+    #[test]
+    fn float_args_by_position() {
+        let stack = [1.5f64.to_bits(), 2.5f32.to_bits() as u64];
+        let xmm = [
+            [0; 2],
+            [3.25f64.to_bits(), 0],
+            [0; 2],
+            [(-1.0f32).to_bits() as u64, 0],
+        ];
+        let c = unsafe { Call::with_xmm([7, 0, 9, 0], xmm, stack.as_ptr()) };
+        assert_eq!(c.arg(0), 7);
+        assert_eq!(c.arg_f64(1), 3.25);
+        assert_eq!(c.arg(2), 9);
+        assert_eq!(c.arg_f32(3), -1.0);
+        assert_eq!(c.arg_f64(4), 1.5);
+        assert_eq!(c.arg_f32(5), 2.5);
+        c.ret_f32(0.5);
+        assert_eq!(c.xmm_ret(), [0.5f32.to_bits() as u64, 0]);
     }
 
     #[test]

@@ -12,14 +12,16 @@ fn main() {
         .data(b"hello from guest code\0")
         .build(|l| {
             let mut c = vec![0x48, 0x83, 0xEC, 0x28]; // sub rsp, 40
-            // lea rcx, [rip + msg]
+                                                      // lea rcx, [rip + msg]
             let next = TEXT_RVA + c.len() as u32 + 7;
             c.extend_from_slice(&[0x48, 0x8D, 0x0D]);
             c.extend_from_slice(&((DATA_RVA as i64 - next as i64) as i32).to_le_bytes());
             for sym in ["OutputDebugStringA", "GetTickCount64"] {
                 let next = TEXT_RVA + c.len() as u32 + 6;
                 c.extend_from_slice(&[0xFF, 0x15]);
-                c.extend_from_slice(&((l.iat("kernel32.dll", sym) as i64 - next as i64) as i32).to_le_bytes());
+                c.extend_from_slice(
+                    &((l.iat("kernel32.dll", sym) as i64 - next as i64) as i32).to_le_bytes(),
+                );
             }
             c.extend_from_slice(&[0xB8, 42, 0, 0, 0]); // mov eax, 42
             c.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28, 0xC3]); // add rsp, 40; ret

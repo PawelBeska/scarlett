@@ -223,17 +223,27 @@ version = "0.1.0"
 dependencies = [
  "env_logger",
  "log",
+ "scarlett-gpu",
  "scarlett-hle",
  "scarlett-loader",
  "scarlett-pe",
 ]
 
 [[package]]
-name = "scarlett-hle"
+name = "scarlett-gpu"
 version = "0.1.0"
 dependencies = [
  "log",
+]
+
+[[package]]
+name = "scarlett-hle"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "log",
  "scarlett-pe",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

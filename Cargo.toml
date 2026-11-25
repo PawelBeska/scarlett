@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/pe", "crates/hle", "crates/loader", "crates/cli"]
+members = ["crates/pe", "crates/hle", "crates/loader", "crates/cli", "crates/gpu"]
 
 [workspace.package]
 version = "0.1.0"
@@ -12,6 +12,7 @@ rust-version = "1.88"
 scarlett-pe = { path = "crates/pe" }
 scarlett-hle = { path = "crates/hle" }
 scarlett-loader = { path = "crates/loader" }
+scarlett-gpu = { path = "crates/gpu" }
 log = "0.4"
 libc = "0.2"
 env_logger = "0.11"
@@ -20,4 +21,5 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Memory",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
 ] }

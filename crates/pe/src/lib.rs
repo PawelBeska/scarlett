@@ -195,8 +195,25 @@ pub struct Tls {
     pub index_va: u64,
     pub callbacks_va: u64,
     pub zero_fill: u32,
+    pub characteristics: u32,
     /// Callback VAs (relative to the preferred image base), if any.
     pub callbacks: Vec<u64>,
+}
+
+impl Tls {
+    /// Bytes of initialised template data.
+    pub fn template_len(&self) -> u64 {
+        self.raw_data_end_va.saturating_sub(self.raw_data_start_va)
+    }
+
+    /// Required block alignment from `IMAGE_SCN_ALIGN_*` bits (20..24);
+    /// 1 when unspecified.
+    pub fn alignment(&self) -> usize {
+        match (self.characteristics >> 20) & 0xF {
+            0 => 1,
+            n => 1 << (n - 1),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -418,6 +435,20 @@ impl<'a> PeFile<'a> {
         Ok(mods)
     }
 
+    /// The DLL's own name from its export directory (`Name` field).
+    pub fn export_dll_name(&self) -> Result<Option<String>> {
+        let dir = self.headers.dir(Dir::Export);
+        if !dir.is_present() {
+            return Ok(None);
+        }
+        let (r, off) = self.at(dir.rva)?;
+        let name = r.u32(off + 12, "export directory")?;
+        if name == 0 {
+            return Ok(None);
+        }
+        self.cstr_at(name).map(Some)
+    }
+
     pub fn exports(&self) -> Result<Vec<Export>> {
         let dir = self.headers.dir(Dir::Export);
         if !dir.is_present() {
@@ -515,6 +546,7 @@ impl<'a> PeFile<'a> {
             index_va: r.u64(off + 16, "TLS directory")?,
             callbacks_va: r.u64(off + 24, "TLS directory")?,
             zero_fill: r.u32(off + 32, "TLS directory")?,
+            characteristics: r.u32(off + 36, "TLS directory")?,
             callbacks: Vec::new(),
         };
         if tls.callbacks_va != 0 {
