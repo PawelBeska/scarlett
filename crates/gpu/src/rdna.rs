@@ -703,6 +703,21 @@ pub mod sop2 {
 }
 
 pub mod sop1 {
+    /// The 32-bit result of a 64-bit-source s_bcnt1/ff1/flbit (see
+    /// S_BCNT1_I32_B64).
+    pub fn bit64(op: u16, x: u64) -> Option<u32> {
+        let none = |n: u32, z: bool| if z { u32::MAX } else { n };
+        Some(match op {
+            S_BCNT1_I32_B64 => x.count_ones(),
+            S_FF1_I32_B64 => none(x.trailing_zeros(), x == 0),
+            S_FLBIT_I32_B64 => none(x.leading_zeros(), x == 0),
+            S_FLBIT_I32_I64 => {
+                let y = if (x as i64) < 0 { !x } else { x };
+                none(y.leading_zeros(), y == 0)
+            }
+            _ => return None,
+        })
+    }
     /// Each bit of `x` twice (see S_BITREPLICATE_B64_B32).
     pub fn bitreplicate(x: u32) -> u64 {
         (0..32).fold(0u64, |r, i| r | ((x as u64 >> i & 1) * 3) << (2 * i))
@@ -722,6 +737,19 @@ pub mod sop1 {
     pub const S_CMOV_B32: u16 = 5;
     pub const S_NOT_B32: u16 = 7;
     pub const S_NOT_B64: u16 = 8;
+    /// 64-bit scalar bit ops (GFX10 opcodes from `SOP1_Real_gfx6_gfx7_gfx10*`
+    /// in `SOPInstructions.td`; ACO selects them for NIR bitfield_reverse,
+    /// bit_count, find_lsb, ufind_msb(_rev) and ifind_msb on 64 bits, with
+    /// -1 for "no bit"). Only s_bcnt1 writes SCC (`Defs = [SCC]`).
+    pub const S_BREV_B64: u16 = 0x0C;
+    pub const S_BCNT1_I32_B64: u16 = 0x10;
+    pub const S_FF1_I32_B64: u16 = 0x14;
+    pub const S_FLBIT_I32_B64: u16 = 0x16;
+    pub const S_FLBIT_I32_I64: u16 = 0x18;
+    /// D[S0[5:0]] = 0 / 1, no SCC (ACO's s_and_b64/s_or_b64 rewrite, as for
+    /// the b32 forms).
+    pub const S_BITSET0_B64: u16 = 0x1C;
+    pub const S_BITSET1_B64: u16 = 0x1E;
     /// D[2i] = D[2i+1] = S0[i], no SCC (Mesa ACO `copy_constant` builds
     /// a wave64 mask from its de-replicated half this way; opcode from
     /// ACO `aco_opcodes.py` and LLVM `SOP1_Real_gfx10` 0x03b).
@@ -2013,6 +2041,13 @@ impl Inst {
             (Format::Sop1, sop1::S_CMOV_B32) => "s_cmov_b32",
             (Format::Sop1, sop1::S_NOT_B32) => "s_not_b32",
             (Format::Sop1, sop1::S_NOT_B64) => "s_not_b64",
+            (Format::Sop1, sop1::S_BREV_B64) => "s_brev_b64",
+            (Format::Sop1, sop1::S_BCNT1_I32_B64) => "s_bcnt1_i32_b64",
+            (Format::Sop1, sop1::S_FF1_I32_B64) => "s_ff1_i32_b64",
+            (Format::Sop1, sop1::S_FLBIT_I32_B64) => "s_flbit_i32_b64",
+            (Format::Sop1, sop1::S_FLBIT_I32_I64) => "s_flbit_i32_i64",
+            (Format::Sop1, sop1::S_BITSET0_B64) => "s_bitset0_b64",
+            (Format::Sop1, sop1::S_BITSET1_B64) => "s_bitset1_b64",
             (Format::Sop1, sop1::S_BITREPLICATE_B64_B32) => "s_bitreplicate_b64_b32",
             (Format::Sop1, sop1::S_BREV_B32) => "s_brev_b32",
             (Format::Sop1, sop1::S_BCNT0_I32_B32) => "s_bcnt0_i32_b32",

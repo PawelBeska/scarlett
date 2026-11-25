@@ -1695,6 +1695,23 @@ fn sop1_step(c: &Ctx, w: &mut Wave, op: u16, d: u8, s0: u16) -> Result<(), ExecE
             let r = if op == sop1::S_BITSET1_B32 { old | bit } else { old & !bit };
             c.set_s32(w, d, r)
         }
+        sop1::S_BREV_B64 => {
+            let r = c.s64(w, s0)?.reverse_bits();
+            c.set_s64(w, d, r)
+        }
+        op if sop1::bit64(op, 0).is_some() => {
+            let r = sop1::bit64(op, c.s64(w, s0)?).unwrap();
+            if op == sop1::S_BCNT1_I32_B64 {
+                w.scc = r != 0;
+            }
+            c.set_s32(w, d, r)
+        }
+        sop1::S_BITSET0_B64 | sop1::S_BITSET1_B64 => {
+            let bit = 1u64 << (c.s32(w, s0)? & 63);
+            let old = c.s64(w, d as u16)?;
+            let r = if op == sop1::S_BITSET1_B64 { old | bit } else { old & !bit };
+            c.set_s64(w, d, r)
+        }
         sop1::S_NOT_B64 => {
             let r = !c.s64(w, s0)?;
             w.scc = r != 0;

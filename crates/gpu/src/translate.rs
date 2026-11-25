@@ -2980,6 +2980,68 @@ impl Tr {
                 self.b.store(self.scc, s);
                 Ok(())
             }
+            sop1::S_BREV_B64 => {
+                let a = self.s64(s0, lit)?;
+                let lo = self.vop1_int(vop1::V_BFREV_B32, a.hi).unwrap();
+                let hi = self.vop1_int(vop1::V_BFREV_B32, a.lo).unwrap();
+                self.set_s64(d, Pair { lo, hi })
+            }
+            o if crate::rdna::sop1::bit64(o, 0).is_some() => {
+                let mut a = self.s64(s0, lit)?;
+                let zero = self.c(0);
+                if o == sop1::S_FLBIT_I32_I64 {
+                    // count from the top in the complement of a negative value
+                    let hi_i = self.as_i32(a.hi);
+                    let zi = self.as_i32(zero);
+                    let neg = self.bl(op::S_LESS_THAN, &[hi_i, zi]);
+                    let (nl, nh) = (self.u(op::NOT, &[a.lo]), self.u(op::NOT, &[a.hi]));
+                    a = Pair { lo: self.select_u(neg, nl, a.lo), hi: self.select_u(neg, nh, a.hi) };
+                }
+                let k32 = self.c(32);
+                let all = self.c(u32::MAX);
+                let (lnz, hnz) = (self.nonzero(a.lo), self.nonzero(a.hi));
+                let r = match o {
+                    sop1::S_BCNT1_I32_B64 => {
+                        let (pl, ph) = (self.u(op::BIT_COUNT, &[a.lo]), self.u(op::BIT_COUNT, &[a.hi]));
+                        let r = self.u(op::I_ADD, &[pl, ph]);
+                        let s = self.nonzero(r);
+                        self.b.store(self.scc, s);
+                        r
+                    }
+                    sop1::S_FF1_I32_B64 => {
+                        let (tl, th) = (self.ctz(a.lo), self.ctz(a.hi));
+                        let th = self.u(op::I_ADD, &[th, k32]);
+                        let r = self.select_u(hnz, th, all);
+                        self.select_u(lnz, tl, r)
+                    }
+                    _ => {
+                        let fl = self.vop1_int(vop1::V_FFBH_U32, a.lo).unwrap();
+                        let fh = self.vop1_int(vop1::V_FFBH_U32, a.hi).unwrap();
+                        let fl = self.u(op::I_ADD, &[fl, k32]);
+                        let r = self.select_u(lnz, fl, all);
+                        self.select_u(hnz, fh, r)
+                    }
+                };
+                self.set_s32(d, r)
+            }
+            sop1::S_BITSET0_B64 | sop1::S_BITSET1_B64 => {
+                let n = self.s32(s0, lit)?;
+                let k63 = self.c(63);
+                let n = self.u(op::BITWISE_AND, &[n, k63]);
+                let (k32, k31, one, zero) = (self.c(32), self.c(31), self.c(1), self.c(0));
+                let ge = self.bl(op::U_GREATER_THAN_EQUAL, &[n, k32]);
+                let sh = self.u(op::BITWISE_AND, &[n, k31]);
+                let b = self.u(op::SHIFT_LEFT_LOGICAL, &[one, sh]);
+                let bit = Pair { lo: self.select_u(ge, zero, b), hi: self.select_u(ge, b, zero) };
+                let old = self.s64(d as u16, 0)?;
+                let r = if opc == sop1::S_BITSET1_B64 {
+                    Pair { lo: self.u(op::BITWISE_OR, &[old.lo, bit.lo]), hi: self.u(op::BITWISE_OR, &[old.hi, bit.hi]) }
+                } else {
+                    let (nl, nh) = (self.u(op::NOT, &[bit.lo]), self.u(op::NOT, &[bit.hi]));
+                    Pair { lo: self.u(op::BITWISE_AND, &[old.lo, nl]), hi: self.u(op::BITWISE_AND, &[old.hi, nh]) }
+                };
+                self.set_s64(d, r)
+            }
             sop1::S_NOT_B64 => {
                 let a = self.s64(s0, lit)?;
                 let lo = self.u(op::NOT, &[a.lo]);

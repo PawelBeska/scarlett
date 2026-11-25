@@ -3250,6 +3250,57 @@ fn f32_rpi_flr_frexp_ldexp() {
     check_all(&code);
 }
 
+/// 64-bit scalar bit ops: s_brev_b64, s_bcnt1_i32_b64 (SCC),
+/// s_ff1_i32_b64, s_flbit_i32_b64/i64, s_bitset0/1_b64; zero, high-only
+/// and negative operands.
+#[test]
+fn scalar_bit_ops_b64() {
+    use scarlett_gpu::rdna::sop1::bit64;
+    assert_eq!(bit64(sop1::S_FF1_I32_B64, 0), Some(u32::MAX));
+    assert_eq!(bit64(sop1::S_FF1_I32_B64, 1 << 40), Some(40));
+    assert_eq!(bit64(sop1::S_FLBIT_I32_B64, 1 << 40), Some(23));
+    assert_eq!(bit64(sop1::S_FLBIT_I32_B64, 0), Some(u32::MAX));
+    assert_eq!(bit64(sop1::S_FLBIT_I32_I64, u64::MAX), Some(u32::MAX));
+    assert_eq!(bit64(sop1::S_FLBIT_I32_I64, !(1u64 << 40)), Some(23));
+    assert_eq!(bit64(sop1::S_BCNT1_I32_B64, u64::MAX), Some(64));
+    let progs = [
+        vec![
+            sop1e(sop1::S_MOV_B32, 8, int(0)),
+            sop1e(sop1::S_MOV_B32, 9, int(0)),
+            sop1e(sop1::S_MOV_B32, 10, int(0)),
+            sop1e(sop1::S_MOV_B32, 11, 1),
+            sop1e(sop1::S_FF1_I32_B64, 12, 8),
+            sop1e(sop1::S_FF1_I32_B64, 13, 10),
+            sop1e(sop1::S_FF1_I32_B64, 14, 0),
+            sop1e(sop1::S_FLBIT_I32_B64, 15, 10),
+            sop1e(sop1::S_FLBIT_I32_B64, 7, 8),
+            sop1e(sop1::S_FLBIT_I32_B64, 6, 2),
+            sop1e(sop1::S_BCNT1_I32_B64, 5, 10), // low word 0, high word not
+            sop1e(sop1::S_BREV_B64, 2, 0),
+            sop1e(sop1::S_BITSET1_B64, 0, 4),
+            sop1e(sop1::S_BITSET0_B64, 10, 3),
+            ENDPGM,
+        ],
+        vec![
+            sop1e(sop1::S_FLBIT_I32_I64, 8, 0),
+            sop1e(sop1::S_FLBIT_I32_I64, 9, int(-1)),
+            sop1e(sop1::S_FLBIT_I32_I64, 10, int(-3)),
+            sop1e(sop1::S_MOV_B32, 12, int(-1)),
+            sop1e(sop1::S_MOV_B32, 13, 2),
+            sop1e(sop1::S_FLBIT_I32_I64, 11, 12),
+            sop1e(sop1::S_MOV_B32, 4, int(0)),
+            sop1e(sop1::S_MOV_B32, 5, int(0)),
+            sop1e(sop1::S_BCNT1_I32_B64, 14, 4), // 0: SCC = 0
+            sop1e(sop1::S_BITSET0_B64, 6, int(63)),
+            sop1e(sop1::S_BITSET1_B64, 2, int(32)),
+            ENDPGM,
+        ],
+    ];
+    for code in &progs {
+        check_all(code);
+    }
+}
+
 /// s_bitreplicate_b64_b32 into SGPRs, VCC and EXEC (a lane mask built
 /// from its half, as ACO does).
 #[test]
