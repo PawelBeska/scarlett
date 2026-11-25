@@ -1349,6 +1349,12 @@ pub mod ds {
     /// and/or/xor = offset[4:0]/[9:5]/[14:10] (LLVM AMDGPUModifierSyntax
     /// and the assembler's encodeBitmaskPerm). FFT/ROTATE not modelled.
     pub const SWIZZLE_B32: u16 = 53;
+    /// Backward permute: D[l] = data0 of the lane (addr + offset) / 4,
+    /// no LDS access. On GFX10 in wave64 it only reaches the lane's own
+    /// half (Mesa ACO emulates a full-wave one with two of them, picking
+    /// by whether the index is in the same half), so the source lane is
+    /// (l & 32) | (index & 31). Opcode 0xB3 (AMD RDNA2 ISA specification).
+    pub const BPERMUTE_B32: u16 = 0xB3;
     /// Wave-level LDS counter: one atomic add of +1 (append) or -1
     /// (consume) per active lane on the dword at M0 + offset, every active
     /// lane gets the uniform pre-op value (NIR `shared_append_amd` /
@@ -2397,6 +2403,7 @@ impl Inst {
             (Format::Vop3, vop3::V_CVT_PK_I16_I32) => "v_cvt_pk_i16_i32",
             (Format::Vop3, vop3::V_MSAD_U8) => "v_msad_u8",
             (Format::Ds, ds::SWIZZLE_B32) => "ds_swizzle_b32",
+            (Format::Ds, ds::BPERMUTE_B32) => "ds_bpermute_b32",
             (Format::Ds, ds::APPEND) => "ds_append",
             (Format::Ds, ds::CONSUME) => "ds_consume",
             (Format::Vop3, vop3::V_ADD_CO_U32) => "v_add_co_u32",
@@ -2635,6 +2642,8 @@ impl Inst {
             (Format::Mubuf, 10) => "buffer_load_ushort",
             (Format::Mubuf, 11) => "buffer_load_sshort",
             (Format::Mubuf, mubuf::STORE_DWORDX3) => "buffer_store_dwordx3",
+            (Format::Mubuf, 0x18) => "buffer_store_byte",
+            (Format::Mubuf, 0x1A) => "buffer_store_short",
             (Format::Mubuf, mubuf::LOAD_DWORD) => "buffer_load_dword",
             (Format::Mubuf, mubuf::LOAD_DWORDX2) => "buffer_load_dwordx2",
             (Format::Mubuf, mubuf::LOAD_DWORDX3) => "buffer_load_dwordx3",

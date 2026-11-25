@@ -1885,6 +1885,26 @@ impl Tr {
                 if opc == ds::SWIZZLE_B32 {
                     return self.ds_swizzle(offset0 as u32 | (offset1 as u32) << 8, addr, vdst);
                 }
+                if opc == ds::BPERMUTE_B32 {
+                    // source lane (l & 32) | (index & 31), see rdna::ds::BPERMUTE_B32
+                    let a = self.vsrc(256 + addr as u16, 0)?;
+                    let oc = self.c(offset0 as u32 | (offset1 as u32) << 8);
+                    let byte = self.u(op::I_ADD, &[a, oc]);
+                    let two = self.c(2);
+                    let idx = self.u(op::SHIFT_RIGHT_LOGICAL, &[byte, two]);
+                    let k31 = self.c(31);
+                    let lo = self.u(op::BITWISE_AND, &[idx, k31]);
+                    let src = if self.wave64 {
+                        let k32 = self.c(32);
+                        let half = self.u(op::BITWISE_AND, &[self.lane, k32]);
+                        self.u(op::BITWISE_OR, &[half, lo])
+                    } else {
+                        lo
+                    };
+                    let v = self.vsrc(256 + data0 as u16, 0)?;
+                    let r = self.lane_value(v, src);
+                    return self.set_vgpr(vdst, r);
+                }
                 if opc == ds::APPEND || opc == ds::CONSUME {
                     return self.ds_append(opc == ds::CONSUME, offset0 as u32 | (offset1 as u32) << 8, vdst);
                 }
@@ -2698,7 +2718,9 @@ impl Tr {
     ) -> Res<()> {
         let atomic = atomic_op(opc);
         let sub = mubuf::sub_dword(opc);
+        let st = matches!(opc, global::STORE_BYTE | global::STORE_SHORT).then(|| global::store_sub(opc).unwrap().0);
         let (n, store) = match (atomic, sub) {
+            _ if st.is_some() => (1, true),
             (Some(_), _) => (1, true),
             (_, Some(_)) => (1, false),
             _ => mubuf::access(opc).ok_or_else(|| self.err("opcode"))?,
@@ -2752,6 +2774,29 @@ impl Tr {
             let rel = self.u(op::I_ADD, &[row, o]);
             let rel = self.u(op::I_ADD, &[rel, so]);
             let at = self.add64(base, Pair { lo: rel, hi: zero });
+            if let Some(bytes) = st {
+                // atomics on the containing dword (see global sub-dword stores)
+                let (k3, nk3, k8) = (self.c(3), self.c(!3), self.c(8));
+                let lo = self.u(op::BITWISE_AND, &[at.lo, nk3]);
+                let (widx, inwin) = self.window_index(win, Pair { lo, hi: at.hi });
+                let en = self.bl(op::LOGICAL_AND, &[ok, active]);
+                let en = self.bl(op::LOGICAL_AND, &[en, inwin]);
+                let sink = self.c(win.words);
+                let slot = self.select_u(en, widx, sink);
+                let p = self.b.op(p_u32, op::ACCESS_CHAIN, &[buf, zero, slot]);
+                let byte = self.u(op::BITWISE_AND, &[at.lo, k3]);
+                let sh = self.u(op::I_MUL, &[byte, k8]);
+                let mask = self.c(if bytes == 1 { 0xFF } else { 0xFFFF });
+                let x = self.vsrc(256 + vdata as u16, 0)?;
+                let x = self.u(op::BITWISE_AND, &[x, mask]);
+                let v = self.u(op::SHIFT_LEFT_LOGICAL, &[x, sh]);
+                let m = self.u(op::SHIFT_LEFT_LOGICAL, &[mask, sh]);
+                let nm = self.u(op::NOT, &[m]);
+                let (sc, relaxed) = (self.c(1), self.c(0));
+                self.u(op::ATOMIC_AND, &[p, sc, relaxed, nm]);
+                self.u(op::ATOMIC_OR, &[p, sc, relaxed, v]);
+                continue;
+            }
             if let Some((bytes, signed)) = sub {
                 // The containing dword, shifted and extended (see global).
                 let (k3, nk3, k8) = (self.c(3), self.c(!3), self.c(8));

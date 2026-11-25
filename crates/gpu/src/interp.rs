@@ -869,6 +869,9 @@ fn step(inst: &Inst, at: usize, w: &mut Wave, mem: &mut dyn Memory) -> Result<()
             if op == ds::SWIZZLE_B32 {
                 return ds_swizzle(&c, w, offset0 as u32 | (offset1 as u32) << 8, addr, vdst);
             }
+            if op == ds::BPERMUTE_B32 {
+                return ds_bpermute(&c, w, offset0 as u32 | (offset1 as u32) << 8, addr, data0, vdst);
+            }
             if op == ds::APPEND || op == ds::CONSUME {
                 return ds_append(&c, w, op == ds::CONSUME, offset0 as u32 | (offset1 as u32) << 8, vdst);
             }
@@ -1160,7 +1163,10 @@ fn mubuf_step(
 ) -> Result<(), ExecError> {
     let atomic = rdna::global::atomic(op, 0, 0, 0).is_some();
     let sub = rdna::mubuf::sub_dword(op);
-    let (n, store) = if atomic {
+    // buffer_store_byte / _short: the global numbers (AMD RDNA2 ISA spec)
+    let st = matches!(op, rdna::global::STORE_BYTE | rdna::global::STORE_SHORT).then(|| rdna::global::store_sub(op).unwrap().0);
+    let mut written: Vec<(u64, u32)> = Vec::new();
+    let (n, store) = if st.is_some() || atomic {
         (1, true)
     } else if sub.is_some() {
         (1, false)
@@ -1190,6 +1196,34 @@ fn mubuf_step(
         let rec_off = offset as u64 + voff as u64;
         if index as u64 * d.stride as u64 + rec_off + 4 * n as u64 > u32::MAX as u64 {
             return Err(c.err("record offset beyond 32 bits"));
+        }
+        if let Some(bytes) = st {
+            let o = rec_off;
+            let ok = d.in_bounds(index, o).ok_or_else(|| c.err("swizzled buffer"))?;
+            if ok && d.oob_select == 3 && o + bytes as u64 > d.num_records as u64 {
+                return Err(c.err("sub-dword store straddles NUM_RECORDS"));
+            }
+            let addr = d.base + index as u64 * d.stride as u64 + o;
+            if !addr.is_multiple_of(bytes as u64) {
+                return Err(c.err("unaligned sub-dword store"));
+            }
+            if !ok {
+                continue;
+            }
+            let m = (if bytes == 1 { 0xFFu32 } else { 0xFFFF }) << (8 * (addr & 3));
+            if written.iter().any(|&(a, wm)| a == addr & !3 && wm & m != 0) {
+                return Err(c.err("two lanes store the same byte"));
+            }
+            written.push((addr & !3, m));
+            let mut x = [0u32];
+            if !mem.read(addr & !3, &mut x) {
+                return Err(ExecError::MemoryFault { at: c.at, addr });
+            }
+            let v = c.v32(w, 256 + vdata as u16, lane)? << (8 * (addr & 3)) & m;
+            if !mem.write(addr & !3, &[x[0] & !m | v]) {
+                return Err(ExecError::MemoryFault { at: c.at, addr });
+            }
+            continue;
         }
         if let Some((bytes, signed)) = sub {
             let o = rec_off;
@@ -1386,6 +1420,37 @@ fn image_step(c: &Ctx, w: &mut Wave, mem: &mut dyn Memory, op: u16) -> Result<()
                 k += 1;
             }
         }
+    }
+    Ok(())
+}
+
+/// ds_bpermute_b32 (see rdna::ds::BPERMUTE_B32). Refused: an unaligned
+/// byte index, an index beyond the wave (32 in wave32, 64 in wave64:
+/// which address bits the hardware uses past that is not stated) and an
+/// inactive source lane.
+fn ds_bpermute(c: &Ctx, w: &mut Wave, off: u32, addr: u8, data0: u8, vdst: u8) -> Result<(), ExecError> {
+    let lanes = w.size.lanes();
+    let mut out = Vec::new();
+    for l in 0..lanes {
+        if !w.active(l) {
+            continue;
+        }
+        let byte = c.v32(w, 256 + addr as u16, l)?.wrapping_add(off);
+        if byte & 3 != 0 {
+            return Err(c.err("ds_bpermute with an unaligned index"));
+        }
+        let idx = (byte / 4) as usize;
+        if idx >= lanes {
+            return Err(c.err("ds_bpermute index beyond the wave"));
+        }
+        let src = (l & 32) | (idx & 31);
+        if !w.active(src) {
+            return Err(c.err("ds_bpermute from an inactive lane"));
+        }
+        out.push((l, c.v32(w, 256 + data0 as u16, src)?));
+    }
+    for (l, v) in out {
+        c.vgpr_mut(w, vdst)?[l] = v;
     }
     Ok(())
 }

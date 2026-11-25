@@ -3687,6 +3687,72 @@ fn flat_as_global() {
     assert!(!run(APERTURES.0 - 1, 0xFFFF_FFFC, 8, Some(APERTURES)), "the offset carries into the LDS aperture");
 }
 
+/// ds_bpermute_b32 (half-wave on GFX10 wave64: indices crossing the half
+/// read the own half) and buffer_store_byte/short from lanes sharing
+/// dwords, with NUM_RECORDS dropping the last ones.
+#[test]
+fn bpermute_and_buffer_sub_dword_stores() {
+    let ds = |op: u16, vdst: u32, addr: u32, d0: u32, off: u32| [0xD800_0000 | (op as u32) << 18 | off, vdst << 24 | d0 << 8 | addr];
+    // LLVM gfx10_asm_ds.s: ds_bpermute_b32 v5, v1, v2 = 0xDACC0000 0x05000201
+    assert_eq!(ds(ds::BPERMUTE_B32, 5, 1, 2, 0), [0xDACC_0000, 0x0500_0201]);
+    let mut code = vec![];
+    code.extend(vop3e(vop3::V_MBCNT_LO_U32_B32, 6, [int(-1), int(0), 0]));
+    code.extend(vop3e(vop3::V_MBCNT_HI_U32_B32, 6, [int(-1), v(6), 0]));
+    for (x, off, d) in [(5, 0u32, 2u32), (33, 0, 3), (1, 8, 4), (63, 4, 5)] {
+        code.push(vop2e(vop2::V_XOR_B32, 7, int(x), 6)); // index lane ^ x
+        code.push(vop2e(vop2::V_LSHLREV_B32, 7, int(2), 7));
+        code.extend([vop2e(vop2::V_SUBREV_NC_U32, 7, LIT, 7), off]); // addr + offset = 4 (lane ^ x)
+        code.extend(ds(ds::BPERMUTE_B32, d, 7, 0, off));
+    }
+    code.push(soppe(sopp::S_WAITCNT, 0));
+    code.push(ENDPGM);
+    for seed in 0..3 {
+        check(&code[..], WaveSize::W64, seed, false);
+    }
+    // wave32 only reaches 32 lanes: masks below 32
+    let mut c32 = vec![];
+    c32.extend(vop3e(vop3::V_MBCNT_LO_U32_B32, 6, [int(-1), int(0), 0]));
+    for (x, off, d) in [(5, 0u32, 2u32), (31, 4, 3)] {
+        c32.push(vop2e(vop2::V_XOR_B32, 7, int(x), 6));
+        c32.push(vop2e(vop2::V_LSHLREV_B32, 7, int(2), 7));
+        c32.extend([vop2e(vop2::V_SUBREV_NC_U32, 7, LIT, 7), off]);
+        c32.extend(ds(ds::BPERMUTE_B32, d, 7, 0, off));
+    }
+    c32.push(ENDPGM);
+    for seed in 0..3 {
+        check(&c32, WaveSize::W32, seed, false);
+    }
+    // refused: an inactive source, an index beyond wave32
+    let mut w = Wave::new(WaveSize::W32, NV as usize);
+    w.exec = 1;
+    w.vgpr[7][0] = 4;
+    assert!(interp::run(&[ds(ds::BPERMUTE_B32, 2, 7, 0, 0).as_slice(), &[ENDPGM]].concat(), &mut w, 10).is_err());
+    let mut w = Wave::new(WaveSize::W32, NV as usize);
+    w.vgpr[7][0] = 32 * 4;
+    assert!(interp::run(&[ds(ds::BPERMUTE_B32, 2, 7, 0, 0).as_slice(), &[ENDPGM]].concat(), &mut w, 10).is_err());
+
+    // buffer_store_byte / short: lane l stores byte l and half-word l (from 64)
+    let table: Vec<u32> = (0..96u32).map(|k| k.wrapping_mul(0x9E37_79B9)).collect();
+    let mut code = vec![];
+    code.extend(vop3e(vop3::V_MBCNT_LO_U32_B32, 7, [int(-1), int(0), 0]));
+    code.extend(vop3e(vop3::V_MBCNT_HI_U32_B32, 7, [int(-1), v(7), 0]));
+    code.extend([sop1e(sop1::S_MOV_B32, 8, LIT), MBASE as u32]);
+    code.extend([sop1e(sop1::S_MOV_B32, 9, LIT), (MBASE >> 32) as u32]);
+    code.extend([sop1e(sop1::S_MOV_B32, 10, LIT), 60 + 128]); // NUM_RECORDS: bytes 60..63 dropped
+    code.extend([sop1e(sop1::S_MOV_B32, 11, LIT), 3 << 28]);
+    code.extend(mubufe(0x18, 0, 7, 8, int(0) as u32, 0, true, false));
+    code.push(vop2e(vop2::V_LSHLREV_B32, 6, int(1), 7));
+    code.extend(mubufe(0x1A, 1, 6, 8, int(0) as u32, 64, true, false));
+    code.push(ENDPGM);
+    for size in [WaveSize::W32, WaveSize::W64] {
+        for seed in 0..3 {
+            for sparse in [false, true] {
+                check_mem(&code, size, seed, sparse, Some((MBASE, &table)));
+            }
+        }
+    }
+}
+
 /// s_bitreplicate_b64_b32 into SGPRs, VCC and EXEC (a lane mask built
 /// from its half, as ACO does).
 #[test]
