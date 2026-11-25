@@ -1386,21 +1386,10 @@ fn ds_step(
     data1: u8,
     vdst: u8,
 ) -> Result<(), ExecError> {
-    let off16 = offset0 as u32 | (offset1 as u32) << 8;
-    let (o0, o1) = (offset0 as u32, offset1 as u32);
-    // (dword byte offsets relative to the lane address, is_write)
-    let (offs, write): (Vec<u32>, bool) = match op {
-        ds::WRITE_B32 => (vec![off16], true),
-        ds::WRITE_B64 => (vec![off16, off16 + 4], true),
-        ds::READ_B32 => (vec![off16], false),
-        ds::READ_B64 => (vec![off16, off16 + 4], false),
-        ds::READ2_B32 => (vec![o0 * 4, o1 * 4], false),
-        ds::READ2ST64_B32 => (vec![o0 * 256, o1 * 256], false),
-        ds::WRITE2_B32 => (vec![o0 * 4, o1 * 4], true),
-        ds::WRITE2ST64_B32 => (vec![o0 * 256, o1 * 256], true),
-        _ => return Err(c.err("opcode")),
-    };
-    let two_regs = matches!(op, ds::WRITE2_B32 | ds::WRITE2ST64_B32);
+    if let Some((bytes, sext, write)) = ds::sub_dword(op) {
+        return ds_sub_dword(c, w, offset0 as u32 | (offset1 as u32) << 8, bytes, sext, write, addr, data0, vdst);
+    }
+    let layout = ds::layout(op, offset0, offset1).ok_or_else(|| c.err("opcode"))?;
     let mut writes: Vec<(usize, u32)> = Vec::new();
     let mut reads: Vec<(usize, Vec<u32>)> = Vec::new();
     for lane in 0..w.size.lanes() {
@@ -1409,17 +1398,17 @@ fn ds_step(
         }
         let a = c.v32(w, 256 + addr as u16, lane)?;
         let mut got = Vec::new();
-        for (k, o) in offs.iter().enumerate() {
-            let byte = a.wrapping_add(*o);
-            if byte & 3 != 0 {
+        for &(o, (sel, sub), align) in &layout.dwords {
+            let byte = a.wrapping_add(o);
+            if byte % align != 0 {
                 return Err(c.err("unaligned LDS access"));
             }
             let idx = (byte / 4) as usize;
             if idx >= w.lds.len() {
                 return Err(c.err("LDS access beyond the allocation"));
             }
-            if write {
-                let r = if two_regs { [data0, data1][k] } else { data0 + k as u8 };
+            if layout.write {
+                let r = [data0, data1][sel as usize] + sub;
                 let v = c.v32(w, 256 + r as u16, lane)?;
                 if writes.iter().any(|(i, _)| *i == idx) {
                     return Err(c.err("two lanes write the same LDS dword"));
@@ -1429,7 +1418,7 @@ fn ds_step(
                 got.push(w.lds[idx]);
             }
         }
-        if !write {
+        if !layout.write {
             reads.push((lane, got));
         }
     }
@@ -1440,6 +1429,49 @@ fn ds_step(
         for (k, v) in vals.into_iter().enumerate() {
             c.vgpr_mut(w, vdst + k as u8)?[lane] = v;
         }
+    }
+    Ok(())
+}
+
+/// ds_read_{u,i}{8,16} (zero / sign extended) and ds_write_b{8,16} (the
+/// low bytes of data0; the rest of the dword is kept). Refused: a 16-bit
+/// access at an odd address, addresses beyond the allocation, and two
+/// lanes writing the same byte.
+#[allow(clippy::too_many_arguments)]
+fn ds_sub_dword(c: &Ctx, w: &mut Wave, off: u32, bytes: u32, sext: bool, write: bool, addr: u8, data0: u8, vdst: u8) -> Result<(), ExecError> {
+    let mut writes: Vec<(usize, u32, u32)> = Vec::new();
+    let mut reads = Vec::new();
+    let mask = if bytes == 1 { 0xFFu32 } else { 0xFFFF };
+    for lane in 0..w.size.lanes() {
+        if !w.active(lane) {
+            continue;
+        }
+        let byte = c.v32(w, 256 + addr as u16, lane)?.wrapping_add(off);
+        if byte % bytes != 0 {
+            return Err(c.err("unaligned LDS access"));
+        }
+        let idx = (byte / 4) as usize;
+        if idx >= w.lds.len() {
+            return Err(c.err("LDS access beyond the allocation"));
+        }
+        let sh = (byte & 3) * 8;
+        if write {
+            let m = mask << sh;
+            if writes.iter().any(|&(i, wm, _)| i == idx && wm & m != 0) {
+                return Err(c.err("two lanes write the same LDS byte"));
+            }
+            writes.push((idx, m, (c.v32(w, 256 + data0 as u16, lane)? & mask) << sh));
+        } else {
+            let v = w.lds[idx] >> sh & mask;
+            let v = if sext { ((v << (32 - 8 * bytes)) as i32 >> (32 - 8 * bytes)) as u32 } else { v };
+            reads.push((lane, v));
+        }
+    }
+    for (idx, m, v) in writes {
+        w.lds[idx] = w.lds[idx] & !m | v;
+    }
+    for (lane, v) in reads {
+        c.vgpr_mut(w, vdst)?[lane] = v;
     }
     Ok(())
 }

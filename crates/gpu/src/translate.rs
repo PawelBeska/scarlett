@@ -2227,28 +2227,19 @@ impl Tr {
     /// orders LDS operations; in SPIR-V that needs a barrier).
     #[allow(clippy::too_many_arguments)]
     fn ds(&mut self, opc: u16, offset0: u8, offset1: u8, addr: u8, data0: u8, data1: u8, vdst: u8) -> Res<()> {
+        if let Some((bytes, sext, write)) = ds::sub_dword(opc) {
+            return self.ds_sub_dword(offset0 as u32 | (offset1 as u32) << 8, bytes, sext, write, addr, data0, vdst);
+        }
         let (arr, ptr, words) = self.lds.ok_or_else(|| self.err("no LDS allocated"))?;
-        let off16 = offset0 as u32 | (offset1 as u32) << 8;
-        let (offs, write): (Vec<u32>, bool) = match opc {
-            ds::WRITE_B32 => (vec![off16], true),
-            ds::WRITE_B64 => (vec![off16, off16 + 4], true),
-            ds::READ_B32 => (vec![off16], false),
-            ds::READ_B64 => (vec![off16, off16 + 4], false),
-            ds::READ2_B32 => (vec![offset0 as u32 * 4, offset1 as u32 * 4], false),
-            ds::READ2ST64_B32 => (vec![offset0 as u32 * 256, offset1 as u32 * 256], false),
-            ds::WRITE2_B32 => (vec![offset0 as u32 * 4, offset1 as u32 * 4], true),
-            ds::WRITE2ST64_B32 => (vec![offset0 as u32 * 256, offset1 as u32 * 256], true),
-            _ => return Err(self.err("opcode")),
-        };
-        let two_regs = matches!(opc, ds::WRITE2_B32 | ds::WRITE2ST64_B32);
+        let layout = ds::layout(opc, offset0, offset1).ok_or_else(|| self.err("opcode"))?;
         let a = self.vsrc(256 + addr as u16, 0)?;
         let act = self.active();
         let wc = self.c(words);
         let sink = self.u(op::I_ADD, &[wc, self.lane]);
         let zero = self.c(0);
         let mut loaded = Vec::new();
-        for (k, o) in offs.iter().enumerate() {
-            let oc = self.c(*o);
+        for &(o, (sel, sub), _) in &layout.dwords {
+            let oc = self.c(o);
             let byte = self.u(op::I_ADD, &[a, oc]);
             let two = self.c(2);
             let idx = self.u(op::SHIFT_RIGHT_LOGICAL, &[byte, two]);
@@ -2256,8 +2247,8 @@ impl Tr {
             let ok = self.bl(op::LOGICAL_AND, &[inr, act]);
             let slot = self.select_u(ok, idx, sink);
             let p = self.b.op(ptr, op::ACCESS_CHAIN, &[arr, slot]);
-            if write {
-                let r = if two_regs { [data0, data1][k] } else { data0 + k as u8 };
+            if layout.write {
+                let r = [data0, data1][sel as usize] + sub;
                 let v = self.vsrc(256 + r as u16, 0)?;
                 self.b.store(p, v);
             } else {
@@ -2270,6 +2261,58 @@ impl Tr {
             self.set_vgpr(vdst + k as u8, v)?;
         }
         Ok(())
+    }
+
+    /// ds_read_{u,i}{8,16} / ds_write_b{8,16} (see `interp::ds_sub_dword`):
+    /// writes clear and set their bytes with OpAtomicAnd / OpAtomicOr, so
+    /// lanes writing other bytes of the same dword do not lose each other's.
+    #[allow(clippy::too_many_arguments)]
+    fn ds_sub_dword(&mut self, off: u32, bytes: u32, sext: bool, write: bool, addr: u8, data0: u8, vdst: u8) -> Res<()> {
+        let (arr, ptr, words) = self.lds.ok_or_else(|| self.err("no LDS allocated"))?;
+        let a = self.vsrc(256 + addr as u16, 0)?;
+        let act = self.active();
+        let wc = self.c(words);
+        let sink = self.u(op::I_ADD, &[wc, self.lane]);
+        let oc = self.c(off);
+        let byte = self.u(op::I_ADD, &[a, oc]);
+        let two = self.c(2);
+        let idx = self.u(op::SHIFT_RIGHT_LOGICAL, &[byte, two]);
+        let inr = self.bl(op::U_LESS_THAN, &[idx, wc]);
+        let ok = self.bl(op::LOGICAL_AND, &[inr, act]);
+        let slot = self.select_u(ok, idx, sink);
+        let p = self.b.op(ptr, op::ACCESS_CHAIN, &[arr, slot]);
+        let (k3, k8) = (self.c(3), self.c(8));
+        let lo = self.u(op::BITWISE_AND, &[byte, k3]);
+        let sh = self.u(op::I_MUL, &[lo, k8]);
+        let mask = self.c(if bytes == 1 { 0xFF } else { 0xFFFF });
+        let zero = self.c(0);
+        if write {
+            let m = self.u(op::SHIFT_LEFT_LOGICAL, &[mask, sh]);
+            let nm = self.u(op::NOT, &[m]);
+            let d = self.vsrc(256 + data0 as u16, 0)?;
+            let d = self.u(op::BITWISE_AND, &[d, mask]);
+            let v = self.u(op::SHIFT_LEFT_LOGICAL, &[d, sh]);
+            let (sc, relaxed) = (self.c(scope::WORKGROUP), self.c(0));
+            self.u(op::ATOMIC_AND, &[p, sc, relaxed, nm]);
+            self.u(op::ATOMIC_OR, &[p, sc, relaxed, v]);
+            self.wave_barrier();
+            return Ok(());
+        }
+        let word = self.load_u(p);
+        let word = self.select_u(ok, word, zero);
+        let x = self.u(op::SHIFT_RIGHT_LOGICAL, &[word, sh]);
+        let r = if sext {
+            let k = self.c(32 - 8 * bytes);
+            let y = self.u(op::SHIFT_LEFT_LOGICAL, &[x, k]);
+            let yi = self.as_i32(y);
+            let t = self.t.i32t;
+            let z = self.b.op(t, op::SHIFT_RIGHT_ARITHMETIC, &[yi, k]);
+            self.bits_of(z)
+        } else {
+            self.u(op::BITWISE_AND, &[x, mask])
+        };
+        self.wave_barrier();
+        self.set_vgpr(vdst, r)
     }
 
     /// `image_load` / `image_store` on a 2D linear image through the

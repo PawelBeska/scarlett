@@ -3322,6 +3322,84 @@ fn mul24_lo_hi() {
     check_all(&code);
 }
 
+/// DS loads/stores beyond dwords: b96/b128, read2/write2(_st64)_b64 and
+/// sub-dword u8/i8/u16/i16 reads and b8/b16 writes, chained so every
+/// read feeds the next write; lanes read their xor-1 / xor-3 neighbours.
+#[test]
+fn ds_wide_and_sub_dword() {
+    let ds3 = |op: u16, vdst: u32, addr: u32, data0: u32, data1: u32, offset: u32| {
+        [0xD800_0000 | (op as u32) << 18 | offset, vdst << 24 | data1 << 16 | data0 << 8 | addr]
+    };
+    assert_eq!(ds3(ds::READ_B128, 252, 1, 0, 0, 0xFFFF), [0xDBFC_FFFF, 0xFC00_0001]);
+    assert_eq!(ds3(ds::WRITE2_B64, 0, 1, 254, 3, 0xFF7F), [0xD938_FF7F, 0x0003_FE01]);
+    // the shared layout table, by hand (both sides use it)
+    let offs = |op, o0, o1| ds::layout(op, o0, o1).unwrap().dwords.iter().map(|d| d.0).collect::<Vec<_>>();
+    assert_eq!(offs(ds::READ2_B64, 1, 2), [8, 12, 16, 20]);
+    assert_eq!(offs(ds::WRITE2ST64_B64, 1, 0), [512, 516, 0, 4]);
+    assert_eq!(offs(ds::READ_B96, 4, 0), [4, 8, 12]);
+    assert_eq!(offs(ds::WRITE_B128, 0, 1), [256, 260, 264, 268]);
+    let regs = ds::layout(ds::WRITE2_B64, 0, 0).unwrap().dwords.iter().map(|d| d.1).collect::<Vec<_>>();
+    assert_eq!(regs, [(0, 0), (0, 1), (1, 0), (1, 1)]);
+    let mut code = vec![];
+    code.extend(vop3e(vop3::V_MBCNT_LO_U32_B32, 6, [int(-1), int(0), 0]));
+    code.extend(vop3e(vop3::V_MBCNT_HI_U32_B32, 6, [int(-1), v(6), 0]));
+    let addr = |code: &mut Vec<u32>, shift: i32, xor: i32| {
+        code.push(vop2e(vop2::V_XOR_B32, 5, int(xor), 6));
+        code.push(vop2e(vop2::V_LSHLREV_B32, 4, int(shift), 5));
+        code.push(vop2e(vop2::V_LSHLREV_B32, 7, int(shift), 6));
+    };
+    addr(&mut code, 4, 1); // v7 = 16 * lane, v4 = 16 * (lane ^ 1)
+    code.extend(ds3(ds::WRITE_B128, 0, 7, 0, 0, 0));
+    code.extend(ds3(ds::READ_B128, 0, 4, 0, 0, 0));
+    code.extend(ds3(ds::WRITE_B96, 0, 7, 1, 0, 0));
+    code.extend(ds3(ds::READ_B96, 1, 4, 0, 0, 0));
+    addr(&mut code, 3, 1); // 8-byte slots
+    code.extend(ds3(ds::WRITE2_B64, 0, 7, 0, 2, 64 << 8)); // +0, +512
+    code.extend(ds3(ds::READ2_B64, 0, 4, 0, 0, 64)); // +512, +0
+    code.extend(ds3(ds::WRITE2ST64_B64, 0, 7, 2, 0, 1)); // +512, +0
+    code.extend(ds3(ds::READ2ST64_B64, 0, 4, 0, 0, 1 << 8));
+    // bytes: lane writes byte `lane`, reads byte `lane ^ 3`
+    code.push(vop1e(vop1::V_MOV_B32, 7, v(6)));
+    code.push(vop2e(vop2::V_XOR_B32, 4, int(3), 6));
+    code.extend(ds3(ds::WRITE_B8, 0, 7, 0, 0, 0));
+    code.extend(ds3(ds::READ_U8, 1, 4, 0, 0, 0));
+    code.extend(ds3(ds::READ_I8, 2, 4, 0, 0, 0));
+    // half-words at 256 + 2 * lane, read at 256 + 2 * (lane ^ 1)
+    code.push(vop2e(vop2::V_LSHLREV_B32, 7, int(1), 6));
+    code.push(vop2e(vop2::V_XOR_B32, 4, int(2), 7));
+    code.extend(ds3(ds::WRITE_B16, 0, 7, 3, 0, 256));
+    code.extend(ds3(ds::READ_U16, 3, 4, 0, 0, 256));
+    code.extend(ds3(ds::READ_I16, 5, 4, 0, 0, 256));
+    code.push(vop2e(vop2::V_LSHLREV_B32, 7, int(1), 7));
+    code.extend(ds3(ds::READ_B32, 6, 7, 0, 0, 0)); // dwords of mixed bytes / halves
+    code.push(soppe(sopp::S_WAITCNT, 0));
+    code.push(ENDPGM);
+    for size in [WaveSize::W32, WaveSize::W64] {
+        for seed in 0..3 {
+            for sparse in [false, true] {
+                check(&code, size, seed, sparse);
+            }
+        }
+    }
+    // refused: b128 at 8-byte alignment, b16 at an odd address, two lanes
+    // writing one byte
+    let run = |c: &[u32], exec: u64, a: [u32; 2]| {
+        let mut w = Wave::new(WaveSize::W32, NV as usize);
+        w.lds = vec![0; LDS_WORDS as usize];
+        w.exec = exec;
+        w.vgpr[1][0] = a[0];
+        w.vgpr[1][1] = a[1];
+        let mut c = c.to_vec();
+        c.push(ENDPGM);
+        interp::run(&c, &mut w, 10)
+    };
+    assert!(run(&ds3(ds::READ_B128, 2, 1, 0, 0, 0), 1, [8, 0]).is_err());
+    assert!(run(&ds3(ds::READ_B128, 2, 1, 0, 0, 0), 1, [16, 0]).is_ok());
+    assert!(run(&ds3(ds::WRITE_B16, 0, 1, 2, 0, 0), 1, [3, 0]).is_err());
+    assert!(run(&ds3(ds::WRITE_B8, 0, 1, 2, 0, 0), 3, [5, 5]).is_err());
+    assert!(run(&ds3(ds::WRITE_B8, 0, 1, 2, 0, 0), 3, [5, 6]).is_ok());
+}
+
 /// s_bitreplicate_b64_b32 into SGPRs, VCC and EXEC (a lane mask built
 /// from its half, as ACO does).
 #[test]

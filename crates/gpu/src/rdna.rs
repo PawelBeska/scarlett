@@ -1225,6 +1225,83 @@ pub mod ds {
     pub const READ2ST64_B32: u16 = 56;
     pub const WRITE_B64: u16 = 77;
     pub const READ_B64: u16 = 118;
+    // More loads/stores (GFX10 opcodes from `gfx10_asm_ds.s` encodings).
+    pub const WRITE_B8: u16 = 0x1E;
+    pub const WRITE_B16: u16 = 0x1F;
+    pub const READ_I8: u16 = 0x39;
+    pub const READ_U8: u16 = 0x3A;
+    pub const READ_I16: u16 = 0x3B;
+    pub const READ_U16: u16 = 0x3C;
+    /// Two qwords at offset0 * 8 and offset1 * 8 (ST64: * 512), as the
+    /// b32 forms scale by the element size (`SILoadStoreOptimizer`).
+    pub const WRITE2_B64: u16 = 0x4E;
+    pub const WRITE2ST64_B64: u16 = 0x4F;
+    pub const READ2_B64: u16 = 0x77;
+    pub const READ2ST64_B64: u16 = 0x78;
+    pub const WRITE_B96: u16 = 0xDE;
+    pub const WRITE_B128: u16 = 0xDF;
+    pub const READ_B96: u16 = 0xFE;
+    pub const READ_B128: u16 = 0xFF;
+
+    /// A dword-granular load/store: per dword its byte offset from the
+    /// lane address, the data register as (operand 0/1, sub-register) for
+    /// writes (reads go to vdst + k), and the alignment the interpreter
+    /// requires of that dword's address. b96/b128 need 16 bytes and the
+    /// b64 halves of read2/write2 8 bytes: what LLVM requires without
+    /// unaligned access mode, which is a configuration the shader does not
+    /// show.
+    pub struct Layout {
+        pub dwords: Vec<(u32, (u8, u8), u32)>,
+        pub write: bool,
+    }
+
+    pub fn layout(op: u16, offset0: u8, offset1: u8) -> Option<Layout> {
+        let off16 = offset0 as u32 | (offset1 as u32) << 8;
+        let (o0, o1) = (offset0 as u32, offset1 as u32);
+        let seq = |n: u32, align: u32| (0..n).map(|k| (off16 + 4 * k, (0, k as u8), if k == 0 { align } else { 4 })).collect::<Vec<_>>();
+        let pair = |a: u32, b: u32, size: u32| {
+            let mut v = Vec::new();
+            for (sel, base) in [(0u8, a), (1u8, b)] {
+                for k in 0..size / 4 {
+                    v.push((base + 4 * k, (sel, k as u8), if k == 0 { size } else { 4 }));
+                }
+            }
+            v
+        };
+        let (dwords, write) = match op {
+            WRITE_B32 => (seq(1, 4), true),
+            WRITE_B64 => (seq(2, 4), true),
+            WRITE_B96 => (seq(3, 16), true),
+            WRITE_B128 => (seq(4, 16), true),
+            READ_B32 => (seq(1, 4), false),
+            READ_B64 => (seq(2, 4), false),
+            READ_B96 => (seq(3, 16), false),
+            READ_B128 => (seq(4, 16), false),
+            READ2_B32 => (pair(o0 * 4, o1 * 4, 4), false),
+            READ2ST64_B32 => (pair(o0 * 256, o1 * 256, 4), false),
+            WRITE2_B32 => (pair(o0 * 4, o1 * 4, 4), true),
+            WRITE2ST64_B32 => (pair(o0 * 256, o1 * 256, 4), true),
+            READ2_B64 => (pair(o0 * 8, o1 * 8, 8), false),
+            READ2ST64_B64 => (pair(o0 * 512, o1 * 512, 8), false),
+            WRITE2_B64 => (pair(o0 * 8, o1 * 8, 8), true),
+            WRITE2ST64_B64 => (pair(o0 * 512, o1 * 512, 8), true),
+            _ => return None,
+        };
+        Some(Layout { dwords, write })
+    }
+
+    /// Sub-dword access: (bytes, sign-extending load, is a write).
+    pub fn sub_dword(op: u16) -> Option<(u32, bool, bool)> {
+        Some(match op {
+            READ_U8 => (1, false, false),
+            READ_I8 => (1, true, false),
+            READ_U16 => (2, false, false),
+            READ_I16 => (2, true, false),
+            WRITE_B8 => (1, false, true),
+            WRITE_B16 => (2, false, true),
+            _ => return None,
+        })
+    }
 
     // LDS atomics (LLVM `DSInstructions.td`, `DS_Real_gfx6_gfx7_gfx10*`);
     // the `_RTN` forms (+0x20) return the old value in vdst.
@@ -2247,6 +2324,20 @@ impl Inst {
             (Format::Ds, ds::READ2_B32) => "ds_read2_b32",
             (Format::Ds, ds::WRITE_B64) => "ds_write_b64",
             (Format::Ds, ds::READ_B64) => "ds_read_b64",
+            (Format::Ds, ds::WRITE_B8) => "ds_write_b8",
+            (Format::Ds, ds::WRITE_B16) => "ds_write_b16",
+            (Format::Ds, ds::READ_I8) => "ds_read_i8",
+            (Format::Ds, ds::READ_U8) => "ds_read_u8",
+            (Format::Ds, ds::READ_I16) => "ds_read_i16",
+            (Format::Ds, ds::READ_U16) => "ds_read_u16",
+            (Format::Ds, ds::WRITE2_B64) => "ds_write2_b64",
+            (Format::Ds, ds::WRITE2ST64_B64) => "ds_write2st64_b64",
+            (Format::Ds, ds::READ2_B64) => "ds_read2_b64",
+            (Format::Ds, ds::READ2ST64_B64) => "ds_read2st64_b64",
+            (Format::Ds, ds::WRITE_B96) => "ds_write_b96",
+            (Format::Ds, ds::WRITE_B128) => "ds_write_b128",
+            (Format::Ds, ds::READ_B96) => "ds_read_b96",
+            (Format::Ds, ds::READ_B128) => "ds_read_b128",
             (Format::Mimg, mimg::IMAGE_LOAD) => "image_load",
             (Format::Mimg, mimg::IMAGE_STORE) => "image_store",
             (Format::Vintrp, vintrp::P1_F32) => "v_interp_p1_f32",
