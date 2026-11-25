@@ -700,6 +700,26 @@ pub mod sop2 {
     pub const S_MUL_I32: u16 = 38;
     pub const S_BFE_U32: u16 = 39;
     pub const S_BFE_I32: u16 = 40;
+    // From AMD's machine-readable RDNA2 ISA specification (see sop1).
+    /// min/max: SCC = 1 iff S0 is the selected value.
+    pub const S_MIN_I32: u16 = 6;
+    pub const S_MIN_U32: u16 = 7;
+    pub const S_MAX_I32: u16 = 8;
+    pub const S_MAX_U32: u16 = 9;
+    pub const S_ORN2_B64: u16 = 0x17;
+    pub const S_NAND_B64: u16 = 0x19;
+    pub const S_NOR_B64: u16 = 0x1B;
+    pub const S_XNOR_B64: u16 = 0x1D;
+    /// ((1 << S0[5:0]) - 1) << S1[5:0], no SCC.
+    pub const S_BFM_B64: u16 = 0x25;
+    /// |S0 - S1| (signed), SCC = result != 0.
+    pub const S_ABSDIFF_I32: u16 = 0x2C;
+    /// D = {S1 half, S0 half}: ll = S0[15:0] | S1[15:0] << 16, lh = S0[15:0]
+    /// | S1[31:16] << 16, hh = S0[31:16] | S1[31:16] << 16 (LLVM's
+    /// build_vector patterns in SIInstructions.td), no SCC.
+    pub const S_PACK_LL_B32_B16: u16 = 0x32;
+    pub const S_PACK_LH_B32_B16: u16 = 0x33;
+    pub const S_PACK_HH_B32_B16: u16 = 0x34;
 }
 
 pub mod sop1 {
@@ -709,6 +729,8 @@ pub mod sop1 {
         let none = |n: u32, z: bool| if z { u32::MAX } else { n };
         Some(match op {
             S_BCNT1_I32_B64 => x.count_ones(),
+            S_BCNT0_I32_B64 => x.count_zeros(),
+            S_FF0_I32_B64 => none((!x).trailing_zeros(), x == u64::MAX),
             S_FF1_I32_B64 => none(x.trailing_zeros(), x == 0),
             S_FLBIT_I32_B64 => none(x.leading_zeros(), x == 0),
             S_FLBIT_I32_I64 => {
@@ -735,6 +757,63 @@ pub mod sop1 {
     pub const S_MOV_B32: u16 = 3;
     pub const S_MOV_B64: u16 = 4;
     pub const S_CMOV_B32: u16 = 5;
+    /// Opcodes and semantics below from AMD's machine-readable RDNA2 ISA
+    /// specification (amdgpu_isa_rdna2.xml, GPUOpen): its descriptions
+    /// give the operand order and which result sets SCC.
+    pub const S_CMOV_B64: u16 = 6;
+    pub const S_BCNT0_I32_B64: u16 = 0x0E;
+    /// Trailing ones before the first 0; -1 if there is no 0 bit.
+    pub const S_FF0_I32_B32: u16 = 0x11;
+    pub const S_FF0_I32_B64: u16 = 0x12;
+    /// saveexec: D = old EXEC; EXEC = op; SCC = EXEC != 0. "n2" negates
+    /// EXEC, "n1" negates S0. wrexec: EXEC = D = op.
+    pub const S_XOR_SAVEEXEC_B64: u16 = 0x26;
+    pub const S_ORN2_SAVEEXEC_B64: u16 = 0x28;
+    pub const S_NAND_SAVEEXEC_B64: u16 = 0x29;
+    pub const S_NOR_SAVEEXEC_B64: u16 = 0x2A;
+    pub const S_XNOR_SAVEEXEC_B64: u16 = 0x2B;
+    pub const S_ANDN1_SAVEEXEC_B64: u16 = 0x37;
+    pub const S_ORN1_SAVEEXEC_B64: u16 = 0x38;
+    pub const S_ANDN1_WREXEC_B64: u16 = 0x39;
+    pub const S_ANDN2_WREXEC_B64: u16 = 0x3A;
+    pub const S_XOR_SAVEEXEC_B32: u16 = 0x3E;
+    pub const S_ORN2_SAVEEXEC_B32: u16 = 0x40;
+    pub const S_NAND_SAVEEXEC_B32: u16 = 0x41;
+    pub const S_NOR_SAVEEXEC_B32: u16 = 0x42;
+    pub const S_XNOR_SAVEEXEC_B32: u16 = 0x43;
+    pub const S_ANDN1_SAVEEXEC_B32: u16 = 0x44;
+    pub const S_ORN1_SAVEEXEC_B32: u16 = 0x45;
+    pub const S_ANDN1_WREXEC_B32: u16 = 0x46;
+    pub const S_ANDN2_WREXEC_B32: u16 = 0x47;
+
+    /// New EXEC from (S0, old EXEC).
+    pub type ExecFn = fn(u64, u64) -> u64;
+
+    /// For a saveexec/wrexec opcode: (is the 64-bit form, writes the new
+    /// EXEC to D instead of the old, new EXEC from (S0, old EXEC)).
+    pub fn exec_op(op: u16) -> Option<(bool, bool, ExecFn)> {
+        let f: ExecFn = match op {
+            S_AND_SAVEEXEC_B64 | S_AND_SAVEEXEC_B32 => |s, e| s & e,
+            S_OR_SAVEEXEC_B64 | S_OR_SAVEEXEC_B32 => |s, e| s | e,
+            S_XOR_SAVEEXEC_B64 | S_XOR_SAVEEXEC_B32 => |s, e| s ^ e,
+            S_ANDN2_SAVEEXEC_B64 | S_ANDN2_SAVEEXEC_B32 | S_ANDN2_WREXEC_B64 | S_ANDN2_WREXEC_B32 => |s, e| s & !e,
+            S_ORN2_SAVEEXEC_B64 | S_ORN2_SAVEEXEC_B32 => |s, e| s | !e,
+            S_NAND_SAVEEXEC_B64 | S_NAND_SAVEEXEC_B32 => |s, e| !(s & e),
+            S_NOR_SAVEEXEC_B64 | S_NOR_SAVEEXEC_B32 => |s, e| !(s | e),
+            S_XNOR_SAVEEXEC_B64 | S_XNOR_SAVEEXEC_B32 => |s, e| !(s ^ e),
+            S_ANDN1_SAVEEXEC_B64 | S_ANDN1_SAVEEXEC_B32 | S_ANDN1_WREXEC_B64 | S_ANDN1_WREXEC_B32 => |s, e| e & !s,
+            S_ORN1_SAVEEXEC_B64 | S_ORN1_SAVEEXEC_B32 => |s, e| e | !s,
+            _ => return None,
+        };
+        let wide = matches!(
+            op,
+            S_AND_SAVEEXEC_B64 | S_OR_SAVEEXEC_B64 | S_XOR_SAVEEXEC_B64 | S_ANDN2_SAVEEXEC_B64 | S_ORN2_SAVEEXEC_B64
+                | S_NAND_SAVEEXEC_B64 | S_NOR_SAVEEXEC_B64 | S_XNOR_SAVEEXEC_B64 | S_ANDN1_SAVEEXEC_B64
+                | S_ORN1_SAVEEXEC_B64 | S_ANDN1_WREXEC_B64 | S_ANDN2_WREXEC_B64
+        );
+        let wr = matches!(op, S_ANDN1_WREXEC_B64 | S_ANDN2_WREXEC_B64 | S_ANDN1_WREXEC_B32 | S_ANDN2_WREXEC_B32);
+        Some((wide, wr, f))
+    }
     pub const S_NOT_B32: u16 = 7;
     pub const S_NOT_B64: u16 = 8;
     /// 64-bit scalar bit ops (GFX10 opcodes from `SOP1_Real_gfx6_gfx7_gfx10*`
@@ -790,6 +869,9 @@ pub mod sopc {
     /// `bitz` / `bitnz` (`aco_select_nir_alu.cpp`).
     pub const S_BITCMP0_B32: u16 = 12;
     pub const S_BITCMP1_B32: u16 = 13;
+    /// SCC = S0[S1[5:0]] == 0 / 1 (AMD RDNA2 ISA specification).
+    pub const S_BITCMP0_B64: u16 = 14;
+    pub const S_BITCMP1_B64: u16 = 15;
     pub const S_CMP_EQ_U64: u16 = 18;
     pub const S_CMP_LG_U64: u16 = 19;
 }
@@ -2138,6 +2220,43 @@ impl Inst {
             (Format::Sop2, sop2::S_BFE_U32) => "s_bfe_u32",
             (Format::Sop2, sop2::S_BFE_I32) => "s_bfe_i32",
             (Format::Sop1, sop1::S_CMOV_B32) => "s_cmov_b32",
+            (Format::Sop1, sop1::S_CMOV_B64) => "s_cmov_b64",
+            (Format::Sop1, sop1::S_BCNT0_I32_B64) => "s_bcnt0_i32_b64",
+            (Format::Sop1, sop1::S_FF0_I32_B32) => "s_ff0_i32_b32",
+            (Format::Sop1, sop1::S_FF0_I32_B64) => "s_ff0_i32_b64",
+            (Format::Sop1, sop1::S_XOR_SAVEEXEC_B64) => "s_xor_saveexec_b64",
+            (Format::Sop1, sop1::S_ORN2_SAVEEXEC_B64) => "s_orn2_saveexec_b64",
+            (Format::Sop1, sop1::S_NAND_SAVEEXEC_B64) => "s_nand_saveexec_b64",
+            (Format::Sop1, sop1::S_NOR_SAVEEXEC_B64) => "s_nor_saveexec_b64",
+            (Format::Sop1, sop1::S_XNOR_SAVEEXEC_B64) => "s_xnor_saveexec_b64",
+            (Format::Sop1, sop1::S_ANDN1_SAVEEXEC_B64) => "s_andn1_saveexec_b64",
+            (Format::Sop1, sop1::S_ORN1_SAVEEXEC_B64) => "s_orn1_saveexec_b64",
+            (Format::Sop1, sop1::S_ANDN1_WREXEC_B64) => "s_andn1_wrexec_b64",
+            (Format::Sop1, sop1::S_ANDN2_WREXEC_B64) => "s_andn2_wrexec_b64",
+            (Format::Sop1, sop1::S_XOR_SAVEEXEC_B32) => "s_xor_saveexec_b32",
+            (Format::Sop1, sop1::S_ORN2_SAVEEXEC_B32) => "s_orn2_saveexec_b32",
+            (Format::Sop1, sop1::S_NAND_SAVEEXEC_B32) => "s_nand_saveexec_b32",
+            (Format::Sop1, sop1::S_NOR_SAVEEXEC_B32) => "s_nor_saveexec_b32",
+            (Format::Sop1, sop1::S_XNOR_SAVEEXEC_B32) => "s_xnor_saveexec_b32",
+            (Format::Sop1, sop1::S_ANDN1_SAVEEXEC_B32) => "s_andn1_saveexec_b32",
+            (Format::Sop1, sop1::S_ORN1_SAVEEXEC_B32) => "s_orn1_saveexec_b32",
+            (Format::Sop1, sop1::S_ANDN1_WREXEC_B32) => "s_andn1_wrexec_b32",
+            (Format::Sop1, sop1::S_ANDN2_WREXEC_B32) => "s_andn2_wrexec_b32",
+            (Format::Sop2, sop2::S_MIN_I32) => "s_min_i32",
+            (Format::Sop2, sop2::S_MIN_U32) => "s_min_u32",
+            (Format::Sop2, sop2::S_MAX_I32) => "s_max_i32",
+            (Format::Sop2, sop2::S_MAX_U32) => "s_max_u32",
+            (Format::Sop2, sop2::S_ORN2_B64) => "s_orn2_b64",
+            (Format::Sop2, sop2::S_NAND_B64) => "s_nand_b64",
+            (Format::Sop2, sop2::S_NOR_B64) => "s_nor_b64",
+            (Format::Sop2, sop2::S_XNOR_B64) => "s_xnor_b64",
+            (Format::Sop2, sop2::S_BFM_B64) => "s_bfm_b64",
+            (Format::Sop2, sop2::S_ABSDIFF_I32) => "s_absdiff_i32",
+            (Format::Sop2, sop2::S_PACK_LL_B32_B16) => "s_pack_ll_b32_b16",
+            (Format::Sop2, sop2::S_PACK_LH_B32_B16) => "s_pack_lh_b32_b16",
+            (Format::Sop2, sop2::S_PACK_HH_B32_B16) => "s_pack_hh_b32_b16",
+            (Format::Sopc, sopc::S_BITCMP0_B64) => "s_bitcmp0_b64",
+            (Format::Sopc, sopc::S_BITCMP1_B64) => "s_bitcmp1_b64",
             (Format::Sop1, sop1::S_NOT_B32) => "s_not_b32",
             (Format::Sop1, sop1::S_NOT_B64) => "s_not_b64",
             (Format::Sop1, sop1::S_BREV_B64) => "s_brev_b64",

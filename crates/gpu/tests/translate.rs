@@ -3400,6 +3400,93 @@ fn ds_wide_and_sub_dword() {
     assert!(run(&ds3(ds::WRITE_B8, 0, 1, 2, 0, 0), 3, [5, 6]).is_ok());
 }
 
+/// SALU from AMD's RDNA2 ISA specification: every saveexec/wrexec form,
+/// s_min/max (SCC = S0 selected), s_absdiff, s_pack_*, s_bfm_b64,
+/// 64-bit nand/nor/xnor/orn2, s_cmov_b64, s_ff0, s_bcnt0_b64,
+/// s_bitcmp*_b64.
+#[test]
+fn salu_from_amd_spec() {
+    use scarlett_gpu::interp::sop2_b32;
+    use scarlett_gpu::rdna::sop1::{bit64, exec_op};
+    assert_eq!(bit64(sop1::S_FF0_I32_B64, 0x0000_0001_FFFF_FFFF), Some(33));
+    assert_eq!(bit64(sop1::S_FF0_I32_B64, u64::MAX), Some(u32::MAX));
+    assert_eq!(bit64(sop1::S_BCNT0_I32_B64, 0xFF), Some(56));
+    assert_eq!(sop2_b32(sop2::S_PACK_LH_B32_B16, 0x1111_2222, 0x3333_4444), Some((0x3333_2222, false)));
+    assert_eq!(sop2_b32(sop2::S_PACK_HH_B32_B16, 0x1111_2222, 0x3333_4444), Some((0x3333_1111, false)));
+    let (_, wr, f) = exec_op(sop1::S_ANDN1_WREXEC_B32).unwrap();
+    assert!(wr && f(0b1100, 0b1010) == 0b0010, "exec & ~S0");
+    let (_, wr, f) = exec_op(sop1::S_ORN2_SAVEEXEC_B64).unwrap();
+    assert!(!wr && f(0b0001, !0b0110) == 0b0111, "S0 | ~exec");
+    // min/max: tie refused, SCC = first selected
+    let mut w = Wave::new(WaveSize::W32, NV as usize);
+    w.sgpr[0] = 5;
+    w.sgpr[1] = 5;
+    assert!(interp::run(&[sop2e(sop2::S_MIN_U32, 2, 0, 1), ENDPGM], &mut w, 10).is_err());
+    let mut w = Wave::new(WaveSize::W32, NV as usize);
+    w.sgpr[0] = 5;
+    w.sgpr[1] = 3;
+    interp::run(&[sop2e(sop2::S_MAX_U32, 2, 0, 1), ENDPGM], &mut w, 10).unwrap();
+    assert!(w.scc && w.sgpr[2] == 5);
+
+    let salu = vec![
+        // operands that always differ: x vs x + 1, x vs !x
+        sop2e(sop2::S_ADD_U32, 8, 0, int(1)),
+        sop2e(sop2::S_MIN_I32, 4, 0, 8),
+        sop1e(sop1::S_NOT_B32, 9, 2),
+        sop2e(sop2::S_MAX_U32, 5, 2, 9),
+        sop1e(sop1::S_NOT_B32, 10, 1),
+        sop2e(sop2::S_MAX_I32, 6, 10, 1),
+        sop2e(sop2::S_MIN_U32, 11, 9, 2),
+        sop2e(sop2::S_ASHR_I32, 8, 0, int(2)),
+        sop2e(sop2::S_ASHR_I32, 9, 1, int(2)),
+        sop2e(sop2::S_ABSDIFF_I32, 7, 8, 9),
+        sop2e(sop2::S_PACK_LL_B32_B16, 8, 2, 3),
+        sop2e(sop2::S_PACK_LH_B32_B16, 9, 3, 2),
+        sop2e(sop2::S_PACK_HH_B32_B16, 10, 0, 3),
+        sop2e(sop2::S_NAND_B64, 12, 0, 2),
+        sop2e(sop2::S_BFM_B64, 14, 1, 2),
+        sop2e(sop2::S_NOR_B64, 0, 2, 12),
+        sop2e(sop2::S_XNOR_B64, 2, 14, 4),
+        sop2e(sop2::S_ORN2_B64, 4, 6, 8),
+        sop1e(sop1::S_FF0_I32_B32, 11, 3),
+        sop1e(sop1::S_FF0_I32_B64, 1, 12),
+        sop1e(sop1::S_BCNT0_I32_B64, 3, 14),
+        sopce(sopc::S_BITCMP1_B64, 4, 9),
+        sop1e(sop1::S_CMOV_B64, 6, 2),
+        sopce(sopc::S_BITCMP0_B64, 14, int(40)),
+        sop1e(sop1::S_CMOV_B64, 8, 0),
+        sopce(sopc::S_CMP_EQ_U32, int(0), int(1)), // SCC = 0: cmov keeps D
+        sop1e(sop1::S_CMOV_B64, 10, 2),
+        sop2e(sop2::S_BFM_B64, 12, int(40), 9), // a field wider than 32
+        ENDPGM,
+    ];
+    check_all(&salu);
+    // saveexec / wrexec: S0 from s[4:5], then a VALU write shows the new exec
+    let pairs = [
+        (sop1::S_XOR_SAVEEXEC_B32, sop1::S_XOR_SAVEEXEC_B64),
+        (sop1::S_ORN2_SAVEEXEC_B32, sop1::S_ORN2_SAVEEXEC_B64),
+        (sop1::S_NAND_SAVEEXEC_B32, sop1::S_NAND_SAVEEXEC_B64),
+        (sop1::S_NOR_SAVEEXEC_B32, sop1::S_NOR_SAVEEXEC_B64),
+        (sop1::S_XNOR_SAVEEXEC_B32, sop1::S_XNOR_SAVEEXEC_B64),
+        (sop1::S_ANDN1_SAVEEXEC_B32, sop1::S_ANDN1_SAVEEXEC_B64),
+        (sop1::S_ORN1_SAVEEXEC_B32, sop1::S_ORN1_SAVEEXEC_B64),
+        (sop1::S_ANDN1_WREXEC_B32, sop1::S_ANDN1_WREXEC_B64),
+        (sop1::S_ANDN2_WREXEC_B32, sop1::S_ANDN2_WREXEC_B64),
+        (sop1::S_ANDN2_SAVEEXEC_B32, sop1::S_ANDN2_SAVEEXEC_B64),
+    ];
+    for (op32, op64) in pairs {
+        for size in [WaveSize::W32, WaveSize::W64] {
+            let op = if size == WaveSize::W64 { op64 } else { op32 };
+            let code = [sop1e(op, 6, 4), vop1e(vop1::V_MOV_B32, 0, int(9)), ENDPGM];
+            for seed in 0..3 {
+                for sparse in [false, true] {
+                    check(&code, size, seed, sparse);
+                }
+            }
+        }
+    }
+}
+
 /// s_bitreplicate_b64_b32 into SGPRs, VCC and EXEC (a lane mask built
 /// from its half, as ACO does).
 #[test]

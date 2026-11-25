@@ -681,6 +681,10 @@ fn step(inst: &Inst, at: usize, w: &mut Wave, mem: &mut dyn Memory) -> Result<()
                 sopc::S_CMP_LE_U32 => a <= b,
                 sopc::S_BITCMP0_B32 => a >> (b & 31) & 1 == 0,
                 sopc::S_BITCMP1_B32 => a >> (b & 31) & 1 == 1,
+                sopc::S_BITCMP0_B64 | sopc::S_BITCMP1_B64 => {
+                    let x = c.s64(w, ssrc0)?;
+                    (x >> (b & 63) & 1 == 1) == (op == sopc::S_BITCMP1_B64)
+                }
                 _ => return Err(c.err("opcode")),
             };
             Ok(())
@@ -1560,6 +1564,10 @@ pub fn sop2_b64(op: u16, a: u64, b: u64) -> Option<u64> {
         sop2::S_OR_B64 => a | b,
         sop2::S_XOR_B64 => a ^ b,
         sop2::S_ANDN2_B64 => a & !b,
+        sop2::S_ORN2_B64 => a | !b,
+        sop2::S_NAND_B64 => !(a & b),
+        sop2::S_NOR_B64 => !(a | b),
+        sop2::S_XNOR_B64 => !(a ^ b),
         _ => return None,
     })
 }
@@ -1600,6 +1608,9 @@ pub fn sop2_b32(op: u16, a: u32, b: u32) -> Option<(u32, bool)> {
         sop2::S_MUL_HI_I32 => (((a as i32 as i64 * b as i32 as i64) >> 32) as u32, false),
         sop2::S_BFE_U32 => (bfe(a, b, false), true),
         sop2::S_BFE_I32 => (bfe(a, b, true), true),
+        sop2::S_PACK_LL_B32_B16 => (a & 0xFFFF | b << 16, false),
+        sop2::S_PACK_LH_B32_B16 => (a & 0xFFFF | b & 0xFFFF_0000, false),
+        sop2::S_PACK_HH_B32_B16 => (a >> 16 | b & 0xFFFF_0000, false),
         _ => return None,
     })
 }
@@ -1629,6 +1640,34 @@ fn sop2_step(c: &Ctx, w: &mut Wave, op: u16, d: u8, s0: u16, s1: u16) -> Result<
     if op == sop2::S_CSELECT_B64 {
         let v = if w.scc { c.s64(w, s0)? } else { c.s64(w, s1)? };
         return c.set_s64(w, d, v);
+    }
+    if op == sop2::S_BFM_B64 {
+        let (n, off) = (c.s32(w, s0)? & 63, c.s32(w, s1)? & 63);
+        return c.set_s64(w, d, (((1u128 << n) - 1) as u64) << off);
+    }
+    if matches!(op, sop2::S_MIN_I32 | sop2::S_MIN_U32 | sop2::S_MAX_I32 | sop2::S_MAX_U32) {
+        let (a, b) = (c.s32(w, s0)?, c.s32(w, s1)?);
+        if a == b {
+            // which operand counts as selected (SCC) is not stated for a tie
+            return Err(c.err("s_min/s_max of equal operands (SCC)"));
+        }
+        let first = match op {
+            sop2::S_MIN_I32 => (a as i32) < (b as i32),
+            sop2::S_MIN_U32 => a < b,
+            sop2::S_MAX_I32 => (a as i32) > (b as i32),
+            _ => a > b,
+        };
+        w.scc = first;
+        return c.set_s32(w, d, if first { a } else { b });
+    }
+    if op == sop2::S_ABSDIFF_I32 {
+        let (a, b) = (c.s32(w, s0)? as i32 as i64, c.s32(w, s1)? as i32 as i64);
+        let r = (a - b).abs();
+        if r > i32::MAX as i64 {
+            return Err(c.err("s_absdiff_i32 beyond i32 (overflow behaviour not stated)"));
+        }
+        w.scc = r != 0;
+        return c.set_s32(w, d, r as u32);
     }
     if sop2_b32(op, 0, 0).is_some() {
         let (a, b) = (c.s32(w, s0)?, c.s32(w, s1)?);
@@ -1695,6 +1734,7 @@ pub fn sop1_b32(op: u16, a: u32) -> Option<(u32, bool)> {
         sop1::S_BCNT1_I32_B32 => (a.count_ones(), true),
         // ffbh: -1 for 0
         sop1::S_FLBIT_I32_B32 => (if a == 0 { u32::MAX } else { a.leading_zeros() }, false),
+        sop1::S_FF0_I32_B32 => (if a == u32::MAX { u32::MAX } else { a.trailing_ones() }, false),
         sop1::S_FLBIT_I32 => (vop1_int(vop1::V_FFBH_I32, a).unwrap(), false),
         sop1::S_SEXT_I32_I8 => (a as u8 as i8 as i32 as u32, false),
         sop1::S_SEXT_I32_I16 => (a as u16 as i16 as i32 as u32, false),
@@ -1733,7 +1773,7 @@ fn sop1_step(c: &Ctx, w: &mut Wave, op: u16, d: u8, s0: u16) -> Result<(), ExecE
         }
         op if sop1::bit64(op, 0).is_some() => {
             let r = sop1::bit64(op, c.s64(w, s0)?).unwrap();
-            if op == sop1::S_BCNT1_I32_B64 {
+            if op == sop1::S_BCNT1_I32_B64 || op == sop1::S_BCNT0_I32_B64 {
                 w.scc = r != 0;
             }
             c.set_s32(w, d, r)
@@ -1778,30 +1818,24 @@ fn sop1_step(c: &Ctx, w: &mut Wave, op: u16, d: u8, s0: u16) -> Result<(), ExecE
             w.scc = r != 0;
             c.set_s32(w, d, r)
         }
-        sop1::S_AND_SAVEEXEC_B64
-        | sop1::S_AND_SAVEEXEC_B32
-        | sop1::S_OR_SAVEEXEC_B64
-        | sop1::S_OR_SAVEEXEC_B32
-        | sop1::S_ANDN2_SAVEEXEC_B64
-        | sop1::S_ANDN2_SAVEEXEC_B32 => {
-            let wide = matches!(
-                op,
-                sop1::S_AND_SAVEEXEC_B64 | sop1::S_OR_SAVEEXEC_B64 | sop1::S_ANDN2_SAVEEXEC_B64
-            );
+        op if sop1::exec_op(op).is_some() => {
+            let (wide, wr, f) = sop1::exec_op(op).unwrap();
             if wide != (w.size == WaveSize::W64) {
                 return Err(c.err("saveexec width does not match the wave size"));
             }
             let src = c.lane_mask(w, s0)?;
             let old = w.exec & w.size.mask();
-            c.set_lane_mask(w, d, old)?;
-            let new = match op {
-                sop1::S_OR_SAVEEXEC_B64 | sop1::S_OR_SAVEEXEC_B32 => src | old,
-                // andn2_saveexec: exec = S0 & ~exec
-                sop1::S_ANDN2_SAVEEXEC_B64 | sop1::S_ANDN2_SAVEEXEC_B32 => src & !old,
-                _ => src & old,
-            } & w.size.mask();
+            let new = f(src, old) & w.size.mask();
+            c.set_lane_mask(w, d, if wr { new } else { old })?;
             w.exec = (w.exec & !w.size.mask()) | new;
             w.scc = !w.execz();
+            Ok(())
+        }
+        sop1::S_CMOV_B64 => {
+            if w.scc {
+                let v = c.s64(w, s0)?;
+                c.set_s64(w, d, v)?;
+            }
             Ok(())
         }
         _ => Err(c.err("opcode")),

@@ -1810,6 +1810,18 @@ impl Tr {
                     sopc::S_CMP_LE_I32 => (op::S_LESS_THAN_EQUAL, true),
                     sopc::S_CMP_LT_U32 => (op::U_LESS_THAN, false),
                     sopc::S_CMP_LE_U32 => (op::U_LESS_THAN_EQUAL, false),
+                    sopc::S_BITCMP0_B64 | sopc::S_BITCMP1_B64 => {
+                        let x = self.s64(ssrc0, lit)?;
+                        let k63 = self.c(63);
+                        let n = self.u(op::BITWISE_AND, &[b, k63]);
+                        let r = self.shift64(sop2::S_LSHR_B64, x, n);
+                        let one = self.c(1);
+                        let bit = self.u(op::BITWISE_AND, &[r.lo, one]);
+                        let want = self.c((opc == sopc::S_BITCMP1_B64) as u32);
+                        let r = self.bl(op::I_EQUAL, &[bit, want]);
+                        self.b.store(self.scc, r);
+                        return Ok(());
+                    }
                     sopc::S_BITCMP0_B32 | sopc::S_BITCMP1_B32 => {
                         let s = self.and31(b);
                         let x = self.u(op::SHIFT_RIGHT_LOGICAL, &[a, s]);
@@ -3006,16 +3018,8 @@ impl Tr {
                 self.b.store(self.scc, s);
                 self.set_s32(d, r)
             }
-            sop1::S_AND_SAVEEXEC_B64
-            | sop1::S_AND_SAVEEXEC_B32
-            | sop1::S_OR_SAVEEXEC_B64
-            | sop1::S_OR_SAVEEXEC_B32
-            | sop1::S_ANDN2_SAVEEXEC_B64
-            | sop1::S_ANDN2_SAVEEXEC_B32 => {
-                let wide = matches!(
-                    opc,
-                    sop1::S_AND_SAVEEXEC_B64 | sop1::S_OR_SAVEEXEC_B64 | sop1::S_ANDN2_SAVEEXEC_B64
-                );
+            o if crate::rdna::sop1::exec_op(o).is_some() => {
+                let (wide, wr, _) = crate::rdna::sop1::exec_op(o).unwrap();
                 if wide != self.wave64 {
                     return Err(self.err("saveexec width does not match the wave size"));
                 }
@@ -3024,27 +3028,69 @@ impl Tr {
                     lo: self.load_u(self.exec_lo),
                     hi: self.load_u(self.exec_hi),
                 };
-                self.set_mask(d, old)?;
-                let comb = |tr: &mut Self, a: Id, e: Id| match opc {
-                    sop1::S_OR_SAVEEXEC_B64 | sop1::S_OR_SAVEEXEC_B32 => tr.u(op::BITWISE_OR, &[a, e]),
-                    sop1::S_ANDN2_SAVEEXEC_B64 | sop1::S_ANDN2_SAVEEXEC_B32 => {
-                        let ne = tr.u(op::NOT, &[e]);
-                        tr.u(op::BITWISE_AND, &[a, ne])
+                let comb = |tr: &mut Self, a: Id, e: Id| {
+                    let not = |tr: &mut Self, x: Id| tr.u(op::NOT, &[x]);
+                    match o {
+                        sop1::S_AND_SAVEEXEC_B64 | sop1::S_AND_SAVEEXEC_B32 => tr.u(op::BITWISE_AND, &[a, e]),
+                        sop1::S_OR_SAVEEXEC_B64 | sop1::S_OR_SAVEEXEC_B32 => tr.u(op::BITWISE_OR, &[a, e]),
+                        sop1::S_XOR_SAVEEXEC_B64 | sop1::S_XOR_SAVEEXEC_B32 => tr.u(op::BITWISE_XOR, &[a, e]),
+                        sop1::S_ANDN2_SAVEEXEC_B64 | sop1::S_ANDN2_SAVEEXEC_B32 | sop1::S_ANDN2_WREXEC_B64 | sop1::S_ANDN2_WREXEC_B32 => {
+                            let ne = not(tr, e);
+                            tr.u(op::BITWISE_AND, &[a, ne])
+                        }
+                        sop1::S_ORN2_SAVEEXEC_B64 | sop1::S_ORN2_SAVEEXEC_B32 => {
+                            let ne = not(tr, e);
+                            tr.u(op::BITWISE_OR, &[a, ne])
+                        }
+                        sop1::S_NAND_SAVEEXEC_B64 | sop1::S_NAND_SAVEEXEC_B32 => {
+                            let x = tr.u(op::BITWISE_AND, &[a, e]);
+                            not(tr, x)
+                        }
+                        sop1::S_NOR_SAVEEXEC_B64 | sop1::S_NOR_SAVEEXEC_B32 => {
+                            let x = tr.u(op::BITWISE_OR, &[a, e]);
+                            not(tr, x)
+                        }
+                        sop1::S_XNOR_SAVEEXEC_B64 | sop1::S_XNOR_SAVEEXEC_B32 => {
+                            let x = tr.u(op::BITWISE_XOR, &[a, e]);
+                            not(tr, x)
+                        }
+                        sop1::S_ORN1_SAVEEXEC_B64 | sop1::S_ORN1_SAVEEXEC_B32 => {
+                            let na = not(tr, a);
+                            tr.u(op::BITWISE_OR, &[e, na])
+                        }
+                        _ => {
+                            // andn1 saveexec / wrexec: exec & ~S0
+                            let na = not(tr, a);
+                            tr.u(op::BITWISE_AND, &[e, na])
+                        }
                     }
-                    _ => tr.u(op::BITWISE_AND, &[a, e]),
                 };
                 let lo = comb(self, src.lo, old.lo);
-                self.b.store(self.exec_lo, lo);
-                let any = if self.wave64 {
+                let new = if self.wave64 {
                     let hi = comb(self, src.hi, old.hi);
-                    self.b.store(self.exec_hi, hi);
-                    self.u(op::BITWISE_OR, &[lo, hi])
+                    Pair { lo, hi }
                 } else {
-                    lo
+                    Pair { lo, hi: old.hi }
+                };
+                self.set_mask(d, if wr { new } else { old })?;
+                self.b.store(self.exec_lo, new.lo);
+                let any = if self.wave64 {
+                    self.b.store(self.exec_hi, new.hi);
+                    self.u(op::BITWISE_OR, &[new.lo, new.hi])
+                } else {
+                    new.lo
                 };
                 let s = self.nonzero(any);
                 self.b.store(self.scc, s);
                 Ok(())
+            }
+            sop1::S_CMOV_B64 => {
+                let v = self.s64(s0, lit)?;
+                let old = self.s64(d as u16, 0)?;
+                let sc = self.b.load(self.t.boolt, self.scc);
+                let lo = self.select_u(sc, v.lo, old.lo);
+                let hi = self.select_u(sc, v.hi, old.hi);
+                self.set_s64(d, Pair { lo, hi })
             }
             sop1::S_BREV_B64 => {
                 let a = self.s64(s0, lit)?;
@@ -3055,6 +3101,10 @@ impl Tr {
             o if crate::rdna::sop1::bit64(o, 0).is_some() => {
                 let mut a = self.s64(s0, lit)?;
                 let zero = self.c(0);
+                if o == sop1::S_FF0_I32_B64 {
+                    // first 0 bit = first 1 bit of the complement
+                    a = Pair { lo: self.u(op::NOT, &[a.lo]), hi: self.u(op::NOT, &[a.hi]) };
+                }
                 if o == sop1::S_FLBIT_I32_I64 {
                     // count from the top in the complement of a negative value
                     let hi_i = self.as_i32(a.hi);
@@ -3067,14 +3117,18 @@ impl Tr {
                 let all = self.c(u32::MAX);
                 let (lnz, hnz) = (self.nonzero(a.lo), self.nonzero(a.hi));
                 let r = match o {
-                    sop1::S_BCNT1_I32_B64 => {
+                    sop1::S_BCNT1_I32_B64 | sop1::S_BCNT0_I32_B64 => {
                         let (pl, ph) = (self.u(op::BIT_COUNT, &[a.lo]), self.u(op::BIT_COUNT, &[a.hi]));
-                        let r = self.u(op::I_ADD, &[pl, ph]);
+                        let mut r = self.u(op::I_ADD, &[pl, ph]);
+                        if o == sop1::S_BCNT0_I32_B64 {
+                            let k64 = self.c(64);
+                            r = self.u(op::I_SUB, &[k64, r]);
+                        }
                         let s = self.nonzero(r);
                         self.b.store(self.scc, s);
                         r
                     }
-                    sop1::S_FF1_I32_B64 => {
+                    sop1::S_FF1_I32_B64 | sop1::S_FF0_I32_B64 => {
                         let (tl, th) = (self.ctz(a.lo), self.ctz(a.hi));
                         let th = self.u(op::I_ADD, &[th, k32]);
                         let r = self.select_u(hnz, th, all);
@@ -3136,6 +3190,10 @@ impl Tr {
                         (self.u(op::I_SUB, &[k32, n]), true)
                     }
                     sop1::S_FLBIT_I32_B32 => (self.vop1_int(vop1::V_FFBH_U32, a).unwrap(), false),
+                    sop1::S_FF0_I32_B32 => {
+                        let na = self.u(op::NOT, &[a]);
+                        (self.vop1_int(vop1::V_FFBL_B32, na).unwrap(), false)
+                    }
                     sop1::S_FLBIT_I32 => (self.vop1_int(vop1::V_FFBH_I32, a).unwrap(), false),
                     _ => {
                         // sext from 8 or 16 bits: shl then ashr
@@ -3165,6 +3223,19 @@ impl Tr {
                 sop2::S_AND_B64 => tr.u(op::BITWISE_AND, &[x, y]),
                 sop2::S_OR_B64 => tr.u(op::BITWISE_OR, &[x, y]),
                 sop2::S_XOR_B64 => tr.u(op::BITWISE_XOR, &[x, y]),
+                sop2::S_ORN2_B64 => {
+                    let ny = tr.u(op::NOT, &[y]);
+                    tr.u(op::BITWISE_OR, &[x, ny])
+                }
+                sop2::S_NAND_B64 | sop2::S_NOR_B64 | sop2::S_XNOR_B64 => {
+                    let o = match opc {
+                        sop2::S_NAND_B64 => op::BITWISE_AND,
+                        sop2::S_NOR_B64 => op::BITWISE_OR,
+                        _ => op::BITWISE_XOR,
+                    };
+                    let r = tr.u(o, &[x, y]);
+                    tr.u(op::NOT, &[r])
+                }
                 _ => {
                     let ny = tr.u(op::NOT, &[y]);
                     tr.u(op::BITWISE_AND, &[x, ny])
@@ -3201,8 +3272,48 @@ impl Tr {
             let hi = self.select_u(sc, a.hi, b.hi);
             return self.set_s64(d, Pair { lo, hi });
         }
+        if opc == sop2::S_BFM_B64 {
+            // ((1 << n) - 1) << off on a pair, n and off in 0..64
+            let (n, off) = (self.s32(s0, lit)?, self.s32(s1, lit)?);
+            let k63 = self.c(63);
+            let (n, off) = (self.u(op::BITWISE_AND, &[n, k63]), self.u(op::BITWISE_AND, &[off, k63]));
+            let (k32, zero, all) = (self.c(32), self.c(0), self.c(u32::MAX));
+            let ge = self.bl(op::U_GREATER_THAN_EQUAL, &[n, k32]);
+            let nlo = self.low_mask(n);
+            let nm32 = self.u(op::I_SUB, &[n, k32]);
+            let nhi = self.low_mask(nm32);
+            let m = Pair { lo: self.select_u(ge, all, nlo), hi: self.select_u(ge, nhi, zero) };
+            let r = self.shift64(sop2::S_LSHL_B64, m, off);
+            return self.set_s64(d, r);
+        }
         let a = self.s32(s0, lit)?;
         let b = self.s32(s1, lit)?;
+        if matches!(opc, sop2::S_MIN_I32 | sop2::S_MIN_U32 | sop2::S_MAX_I32 | sop2::S_MAX_U32) {
+            // SCC = S0 selected (ties are refused by the interpreter)
+            let signed = matches!(opc, sop2::S_MIN_I32 | sop2::S_MAX_I32);
+            let (x, y) = if signed { (self.as_i32(a), self.as_i32(b)) } else { (a, b) };
+            let cmp = match (opc, signed) {
+                (sop2::S_MIN_I32, _) => op::S_LESS_THAN,
+                (sop2::S_MIN_U32, _) => op::U_LESS_THAN,
+                (sop2::S_MAX_I32, _) => op::S_GREATER_THAN,
+                _ => op::U_GREATER_THAN,
+            };
+            let first = self.bl(cmp, &[x, y]);
+            self.b.store(self.scc, first);
+            let r = self.select_u(first, a, b);
+            return self.set_s32(d, r);
+        }
+        if opc == sop2::S_ABSDIFF_I32 {
+            let diff = self.u(op::I_SUB, &[a, b]);
+            let (ai, bi) = (self.as_i32(a), self.as_i32(b));
+            let lt = self.bl(op::S_LESS_THAN, &[ai, bi]);
+            let zero = self.c(0);
+            let neg = self.u(op::I_SUB, &[zero, diff]);
+            let r = self.select_u(lt, neg, diff);
+            let s = self.nonzero(r);
+            self.b.store(self.scc, s);
+            return self.set_s32(d, r);
+        }
         if crate::interp::sop2_b32(opc, 0, 0).is_some() && opc != sop2::S_AND_B32 {
             let not = |tr: &mut Self, x: Id| tr.u(op::NOT, &[x]);
             let (r, scc) = match opc {
@@ -3232,6 +3343,20 @@ impl Tr {
                 sop2::S_LSHR_B32 => (self.vop2_int(vop2::V_LSHRREV_B32, b, a).unwrap(), true),
                 sop2::S_ASHR_I32 => (self.vop2_int(vop2::V_ASHRREV_I32, b, a).unwrap(), true),
                 sop2::S_MUL_I32 => (self.u(op::I_MUL, &[a, b]), false),
+                sop2::S_PACK_LL_B32_B16 | sop2::S_PACK_LH_B32_B16 | sop2::S_PACK_HH_B32_B16 => {
+                    let (k16, lo16, hi16) = (self.c(16), self.c(0xFFFF), self.c(0xFFFF_0000));
+                    let l = if opc == sop2::S_PACK_HH_B32_B16 {
+                        self.u(op::SHIFT_RIGHT_LOGICAL, &[a, k16])
+                    } else {
+                        self.u(op::BITWISE_AND, &[a, lo16])
+                    };
+                    let h = if opc == sop2::S_PACK_LL_B32_B16 {
+                        self.u(op::SHIFT_LEFT_LOGICAL, &[b, k16])
+                    } else {
+                        self.u(op::BITWISE_AND, &[b, hi16])
+                    };
+                    (self.u(op::BITWISE_OR, &[l, h]), false)
+                }
                 sop2::S_BFM_B32 => {
                     let n = self.and31(a);
                     let m = self.low_mask(n);
