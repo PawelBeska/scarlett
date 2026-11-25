@@ -3404,6 +3404,47 @@ impl Tr {
                 let r = self.bits_of(x);
                 self.set_vgpr(vdst, r)
             }
+            vop1::V_CVT_RPI_I32_F32 | vop1::V_CVT_FLR_I32_F32 => {
+                // in range only (the interpreter refuses the rest)
+                let a = self.vsrc(src0, lit)?;
+                let f = self.t.f32t;
+                let mut x = self.as_f32(a);
+                if opc == vop1::V_CVT_RPI_I32_F32 {
+                    let half = self.b.constant_f32(0.5);
+                    x = self.b.op(f, op::F_ADD, &[x, half]);
+                }
+                let set = self.glsl_set();
+                let y = self.b.op(f, op::EXT_INST, &[set, glsl::FLOOR, x]);
+                let i = self.t.i32t;
+                let v = self.b.op(i, op::CONVERT_F_TO_S, &[y]);
+                let r = self.bits_of(v);
+                self.set_vgpr(vdst, r)
+            }
+            vop1::V_FREXP_EXP_I32_F32 | vop1::V_FREXP_MANT_F32 => {
+                // on the bit pattern: a normal value keeps sign and
+                // mantissa with exponent -1 and reports e - 126; zero,
+                // Inf and NaN give exponent 0 and themselves
+                let a = self.vsrc(src0, lit)?;
+                let (k23, kff) = (self.c(23), self.c(0xFF));
+                let e = self.u(op::SHIFT_RIGHT_LOGICAL, &[a, k23]);
+                let e = self.u(op::BITWISE_AND, &[e, kff]);
+                let (zero, k255) = (self.c(0), self.c(255));
+                let nz = self.bl(op::I_NOT_EQUAL, &[e, zero]);
+                let ni = self.bl(op::I_NOT_EQUAL, &[e, k255]);
+                let normal = self.and_b(nz, ni);
+                let r = if opc == vop1::V_FREXP_EXP_I32_F32 {
+                    let k126 = self.c(126);
+                    let x = self.u(op::I_SUB, &[e, k126]);
+                    self.select_u(normal, x, zero)
+                } else {
+                    let keep = self.c(0x807F_FFFF);
+                    let x = self.u(op::BITWISE_AND, &[a, keep]);
+                    let half = self.c(126 << 23);
+                    let x = self.u(op::BITWISE_OR, &[x, half]);
+                    self.select_u(normal, x, a)
+                };
+                self.set_vgpr(vdst, r)
+            }
             vop1::V_CVT_U32_F32 | vop1::V_CVT_I32_F32 => {
                 // The hardware saturates and maps NaN to 0; SPIR-V leaves
                 // out-of-range conversions undefined, so clamp first.
@@ -3766,6 +3807,44 @@ impl Tr {
                 let hi = self.u(op::BITWISE_AND, &[old, km]);
                 let out = self.u(op::BITWISE_OR, &[hi, r]);
                 self.set_vgpr(vdst, out)
+            }
+            vop3::V_LDEXP_F32 => {
+                if neg != 0 {
+                    return Err(self.err("neg on v_ldexp_f32"));
+                }
+                // add n to the exponent field of a normal value; overflow
+                // gives ±Inf, zero/Inf/NaN pass through
+                let a = self.vsrc(src[0], lit)?;
+                let n = self.vsrc(src[1], lit)?;
+                let (k23, kff) = (self.c(23), self.c(0xFF));
+                let e = self.u(op::SHIFT_RIGHT_LOGICAL, &[a, k23]);
+                let e = self.u(op::BITWISE_AND, &[e, kff]);
+                let (zero, k255) = (self.c(0), self.c(255));
+                let ez = self.bl(op::I_EQUAL, &[e, zero]);
+                let ei = self.bl(op::I_EQUAL, &[e, k255]);
+                let special = self.bl(op::LOGICAL_OR, &[ez, ei]);
+                let (lo, hi) = (self.c((-512i32) as u32), self.c(512));
+                let (ni, loi, hii) = (self.as_i32(n), self.as_i32(lo), self.as_i32(hi));
+                let below = self.bl(op::S_LESS_THAN, &[ni, loi]);
+                let above = self.bl(op::S_GREATER_THAN, &[ni, hii]);
+                let nc = self.select_u(below, lo, n);
+                let nc = self.select_u(above, hi, nc);
+                let e2 = self.u(op::I_ADD, &[e, nc]);
+                let (e2i, k255i, zi) = (self.as_i32(e2), self.as_i32(k255), self.as_i32(zero));
+                let over = self.bl(op::S_GREATER_THAN_EQUAL, &[e2i, k255i]);
+                let under = self.bl(op::S_LESS_THAN_EQUAL, &[e2i, zi]);
+                let sb = self.c(0x8000_0000);
+                let sign = self.u(op::BITWISE_AND, &[a, sb]);
+                let infc = self.c(0x7F80_0000);
+                let inf = self.u(op::BITWISE_OR, &[sign, infc]);
+                let keep = self.c(0x807F_FFFF);
+                let m = self.u(op::BITWISE_AND, &[a, keep]);
+                let e2s = self.u(op::SHIFT_LEFT_LOGICAL, &[e2, k23]);
+                let norm = self.u(op::BITWISE_OR, &[m, e2s]);
+                let r = self.select_u(under, sign, norm);
+                let r = self.select_u(over, inf, r);
+                let r = self.select_u(special, a, r);
+                self.set_vgpr(vdst, r)
             }
             vop3::V_READLANE_B32 | vop3::V_WRITELANE_B32 => {
                 if neg != 0 {

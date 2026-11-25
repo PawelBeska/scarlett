@@ -3173,6 +3173,83 @@ fn f64_conversions() {
     check_all(&code);
 }
 
+/// v_cvt_rpi/flr_i32_f32, v_frexp_exp/mant and v_ldexp_f32 on floats
+/// with exponents 110..173 built from v0, ties, zeros and Inf.
+#[test]
+fn f32_rpi_flr_frexp_ldexp() {
+    use scarlett_gpu::interp::{ldexp_f32, vop1_f32_special as sp};
+    let f = |x: f32| x.to_bits();
+    let i = |op, x: f32| sp(op, f(x)).map(|r| r as i32);
+    assert_eq!(i(vop1::V_CVT_RPI_I32_F32, 2.5), Some(3));
+    assert_eq!(i(vop1::V_CVT_RPI_I32_F32, -2.5), Some(-2));
+    assert_eq!(i(vop1::V_CVT_RPI_I32_F32, 0.49999997), Some(1), "x + 0.5 rounds to 1.0");
+    assert_eq!(i(vop1::V_CVT_FLR_I32_F32, -0.1), Some(-1));
+    assert_eq!(i(vop1::V_CVT_FLR_I32_F32, 3e9), None, "out of range");
+    assert_eq!(i(vop1::V_CVT_FLR_I32_F32, f32::NAN), None);
+    assert_eq!(i(vop1::V_FREXP_EXP_I32_F32, 8.0), Some(4));
+    assert_eq!(sp(vop1::V_FREXP_MANT_F32, f(-12.0)), Some(f(-0.75)));
+    assert_eq!(i(vop1::V_FREXP_EXP_I32_F32, f32::INFINITY), Some(0));
+    assert_eq!(i(vop1::V_FREXP_EXP_I32_F32, f32::NAN), Some(0));
+    assert_eq!(sp(vop1::V_FREXP_MANT_F32, f(f32::NEG_INFINITY)), Some(f(f32::NEG_INFINITY)));
+    assert_eq!(sp(vop1::V_FREXP_MANT_F32, f(f32::NAN)), None);
+    assert_eq!(ldexp_f32(f(1.5), 3), Some(f(12.0)));
+    assert_eq!(ldexp_f32(f(-1.0), 200), Some(f(f32::NEG_INFINITY)));
+    assert_eq!(ldexp_f32(f(1.0), -127), None, "subnormal result");
+    assert_eq!(ldexp_f32(f(-0.0), 5), Some(f(-0.0)));
+    assert_eq!(vop1e(vop1::V_FREXP_MANT_F32, 5, v(1)), 0x7E0A_8101);
+    assert_eq!(vop3e(vop3::V_LDEXP_F32, 5, [v(1), v(2), int(0)]), [0xD762_0005, 0x0202_0501]);
+
+    const L: u16 = 255;
+    let mut code = vec![
+        // v2 = float with exponent 110 + (v0 >> 8 & 63)
+        vop2e(vop2::V_LSHRREV_B32, 2, int(8), 0),
+        vop2e(vop2::V_AND_B32, 2, int(63), 2),
+        vop2e(vop2::V_ADD_NC_U32, 2, L, 2), 110,
+        vop2e(vop2::V_LSHLREV_B32, 2, int(23), 2),
+        vop2e(vop2::V_AND_B32, 3, L, 0), 0x807F_FFFF,
+        vop2e(vop2::V_OR_B32, 2, v(2), 3),
+        // v3 = n in -20..107
+        vop2e(vop2::V_AND_B32, 3, L, 1), 0x7F,
+        vop2e(vop2::V_SUBREV_NC_U32, 3, L, 3), 20,
+        sop1e(sop1::S_MOV_B32, 4, L), 0x7F80_0000, // +Inf
+        sop1e(sop1::S_MOV_B32, 5, L), 0x8000_0000, // -0
+    ];
+    code.extend(vop3e(vop3::V_LDEXP_F32, 4, [v(2), v(3), int(0)]));
+    code.extend(vop3e(vop3::V_LDEXP_F32, 5, [4, v(3), int(0)]));
+    code.extend(vop3e(vop3::V_LDEXP_F32, 6, [7, 6, int(0)])); // 1.5 * 2^128 = Inf
+    code.splice(0..0, [sop1e(sop1::S_MOV_B32, 6, L), 128, sop1e(sop1::S_MOV_B32, 7, L), 0x3FC0_0000]);
+    code.extend(vop3e(vop3::V_LDEXP_F32, 7, [v(2), L, int(0)]));
+    code.push(0x7FFF_FFFF);
+    code.extend([
+        vop1e(vop1::V_FREXP_EXP_I32_F32, 0, v(2)),
+        vop1e(vop1::V_FREXP_MANT_F32, 1, v(2)),
+        vop1e(vop1::V_FREXP_MANT_F32, 3, 4), // Inf
+        vop1e(vop1::V_FREXP_EXP_I32_F32, 5, 4),
+        ENDPGM,
+    ]);
+    check_all(&code);
+    // conversions on |x| < 2^23 (exponent 110 + 0..31) and ties
+    let code = [
+        vop2e(vop2::V_LSHRREV_B32, 2, int(8), 0),
+        vop2e(vop2::V_AND_B32, 2, int(31), 2),
+        vop2e(vop2::V_ADD_NC_U32, 2, L, 2), 110,
+        vop2e(vop2::V_LSHLREV_B32, 2, int(23), 2),
+        vop2e(vop2::V_AND_B32, 3, L, 0), 0x807F_FFFF,
+        vop2e(vop2::V_OR_B32, 2, v(2), 3),
+        vop2e(vop2::V_AND_B32, 4, L, 1), 0x8000_0007,
+        vop1e(vop1::V_CVT_F32_I32, 4, v(4)),
+        vop2e(vop2::V_ADD_F32, 4, 240, 4), // k + 0.5
+        vop1e(vop1::V_CVT_RPI_I32_F32, 0, v(2)),
+        vop1e(vop1::V_CVT_FLR_I32_F32, 1, v(2)),
+        vop1e(vop1::V_CVT_RPI_I32_F32, 5, v(4)),
+        vop1e(vop1::V_CVT_FLR_I32_F32, 6, v(4)),
+        vop1e(vop1::V_CVT_RPI_I32_F32, 7, 241), // -0.5
+        vop1e(vop1::V_CVT_FLR_I32_F32, 3, 241),
+        ENDPGM,
+    ];
+    check_all(&code);
+}
+
 /// s_bitreplicate_b64_b32 into SGPRs, VCC and EXEC (a lane mask built
 /// from its half, as ACO does).
 #[test]

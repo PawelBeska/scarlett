@@ -453,6 +453,54 @@ fn float_cond(cond: u16, x: f64, y: f64) -> bool {
     }
 }
 
+/// v_cvt_rpi/flr_i32_f32 and v_frexp_exp/mant (see rdna::vop1). None
+/// (refused): a NaN or out-of-range result for the conversions (poison in
+/// LLVM's patterns), a subnormal input or NaN significand for frexp (FP32
+/// denormal mode, NaN bits).
+pub fn vop1_f32_special(op: u16, a: u32) -> Option<u32> {
+    let x = f32::from_bits(a);
+    let to_int = |y: f32| (-2_147_483_648.0..2_147_483_648.0).contains(&y).then_some(y as i32 as u32);
+    match op {
+        vop1::V_CVT_RPI_I32_F32 => to_int((x + 0.5).floor()),
+        vop1::V_CVT_FLR_I32_F32 => to_int(x.floor()),
+        _ => {
+            if x.is_subnormal() {
+                return None;
+            }
+            if !x.is_normal() {
+                // zero, Inf, NaN: exponent 0, significand unchanged
+                return if op == vop1::V_FREXP_EXP_I32_F32 { Some(0) } else { (!x.is_nan()).then_some(a) };
+            }
+            // |x| = m * 2^e with 0.5 <= m < 1
+            let e = (a >> 23 & 0xFF) as i32 - 126;
+            let m = x as f64 / 2f64.powi(e);
+            debug_assert!((0.5..1.0).contains(&m.abs()));
+            Some(if op == vop1::V_FREXP_EXP_I32_F32 { e as u32 } else { (m as f32).to_bits() })
+        }
+    }
+}
+
+/// v_ldexp_f32: x * 2^n, exact for a normal result. None (refused): NaN
+/// or subnormal x, or a result below the smallest normal (FP32 denormal
+/// mode); overflow gives ±Inf.
+pub fn ldexp_f32(a: u32, n: i32) -> Option<u32> {
+    let x = f32::from_bits(a);
+    if x.is_nan() || x.is_subnormal() {
+        return None;
+    }
+    if x == 0.0 || x.is_infinite() {
+        return Some(a);
+    }
+    let r = x as f64 * 2f64.powi(n.clamp(-400, 400));
+    if r.abs() >= 2f64.powi(128) {
+        return Some(a & 0x8000_0000 | 0x7F80_0000);
+    }
+    if r.abs() < f32::MIN_POSITIVE as f64 {
+        return None;
+    }
+    Some((r as f32).to_bits())
+}
+
 /// f64 -> i32 / u32 (saturating, NaN -> 0: LLVM's `fp_to_*_sat`, Rust's
 /// `as`) and f64 -> f32 (round to nearest even). None (refused) for the
 /// f32 result: a NaN (its bits), a subnormal input (FP64 denormal mode)
@@ -1774,6 +1822,15 @@ fn vop1_step(c: &Ctx, w: &mut Wave, op: u16, vdst: u8, src0: u16) -> Result<(), 
         vop1::V_CVT_U32_F32 => for_active(c, w, vdst, |w, l| {
             Ok(f32::from_bits(c.v32(w, src0, l)?) as u32)
         }),
+        op if matches!(
+            op,
+            vop1::V_CVT_RPI_I32_F32 | vop1::V_CVT_FLR_I32_F32 | vop1::V_FREXP_EXP_I32_F32 | vop1::V_FREXP_MANT_F32
+        ) =>
+        {
+            for_active(c, w, vdst, |w, l| {
+                vop1_f32_special(op, c.v32(w, src0, l)?).ok_or_else(|| c.err("value the sources leave open (NaN, subnormal or out of range)"))
+            })
+        }
         vop1::V_CVT_I32_F32 => for_active(c, w, vdst, |w, l| {
             Ok(f32::from_bits(c.v32(w, src0, l)?) as i32 as u32)
         }),
@@ -2405,6 +2462,9 @@ fn vop3_step(c: &Ctx, w: &mut Wave) -> Result<(), ExecError> {
                 _ => med3_f32(a, b, d),
             };
             r.ok_or_else(|| c.err("min3/max3/med3 case left open (NaN rules)"))
+        }),
+        vop3::V_LDEXP_F32 => for_active(c, w, vdst, |w, l| {
+            ldexp_f32(c.v32(w, src[0], l)?, c.v32(w, src[1], l)? as i32).ok_or_else(|| c.err("v_ldexp_f32 of a NaN or subnormal, or a subnormal result"))
         }),
         vop3::V_READLANE_B32 | vop3::V_WRITELANE_B32 => {
             if abs != 0 || neg != 0 {

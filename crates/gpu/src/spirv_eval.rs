@@ -1064,8 +1064,9 @@ fn step(
             })
         }
         op::CONVERT_F_TO_S => {
+            // compare in f64: -2^31 - 1 is not an f32 (it rounds to -2^31)
             let x = f(o[2])?;
-            Some(if x > -2_147_483_649.0 && x < 2_147_483_648.0 {
+            Some(if (x as f64) > -2_147_483_649.0 && (x as f64) < 2_147_483_648.0 {
                 Val::Word(x as i32 as u32)
             } else {
                 Val::Undef

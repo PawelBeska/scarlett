@@ -780,6 +780,15 @@ pub mod vop1 {
     pub const V_CVT_F32_U32: u16 = 6;
     pub const V_CVT_U32_F32: u16 = 7;
     pub const V_CVT_I32_F32: u16 = 8;
+    /// fp_to_sint(floor(x + 0.5)) / fp_to_sint(floor(x)): LLVM's
+    /// `cvt_rpi_i32_f32` / `cvt_flr_i32_f32` PatFrags (opcodes from
+    /// `gfx10_asm_vop1.s`: `v_cvt_rpi_i32_f32_e32 v5, v1` = 0x7E0A1901).
+    pub const V_CVT_RPI_I32_F32: u16 = 0x0C;
+    pub const V_CVT_FLR_I32_F32: u16 = 0x0D;
+    /// frexp exponent / significand (LLVM's constant folding of
+    /// `amdgcn_frexp_exp/mant`: APFloat frexp, exponent 0 for Inf/NaN).
+    pub const V_FREXP_EXP_I32_F32: u16 = 0x3F;
+    pub const V_FREXP_MANT_F32: u16 = 0x40;
     pub const V_CVT_F32_UBYTE0: u16 = 17;
     pub const V_CVT_F32_UBYTE1: u16 = 18;
     pub const V_CVT_F32_UBYTE2: u16 = 19;
@@ -890,6 +899,9 @@ pub mod vop3 {
     /// ((1 << S0[4:0]) - 1) << S1[4:0] (NIR `bfm`, which ACO selects as
     /// this; `v_bfm_b32 v5, v1, v2` = 0xD7630005 0x00020501).
     pub const V_BFM_B32: u16 = 0x363;
+    /// S0 * 2^S1 (S1 a signed integer; LLVM `fldexp`), VOP3 only on
+    /// GFX10 (`v_ldexp_f32 v5, v1, v2` = 0xD7620005 0x00020501).
+    pub const V_LDEXP_F32: u16 = 0x362;
     /// fminnum(fminnum(a, b), c) / fmaxnum(...): LLVM forms them from such
     /// chains (AMDGPUfmin3/fmax3); `gfx10_asm_vop3.s`: `v_min3_f32 v5, v1,
     /// v2, v3` = 0xD5510005 0x040E0501.
@@ -2069,6 +2081,7 @@ impl Inst {
             (Format::Vop3, vop3::V_MAD_U64_U32) => "v_mad_u64_u32",
             (Format::Vop3, vop3::V_XOR3_B32) => "v_xor3_b32",
             (Format::Vop3, vop3::V_BFM_B32) => "v_bfm_b32",
+            (Format::Vop3, vop3::V_LDEXP_F32) => "v_ldexp_f32",
             (Format::Vop3, vop3::V_MIN3_F32) => "v_min3_f32",
             (Format::Vop3, vop3::V_MAX3_F32) => "v_max3_f32",
             (Format::Vop3, vop3::V_MED3_F32) => "v_med3_f32",
@@ -2104,6 +2117,10 @@ impl Inst {
             (Format::Vop1, vop1::V_CVT_F32_UBYTE3) => "v_cvt_f32_ubyte3",
             (Format::Vop1, vop1::V_TRUNC_F32) => "v_trunc_f32",
             (Format::Vop1, vop1::V_TRUNC_F64) => "v_trunc_f64",
+            (Format::Vop1, vop1::V_CVT_RPI_I32_F32) => "v_cvt_rpi_i32_f32",
+            (Format::Vop1, vop1::V_CVT_FLR_I32_F32) => "v_cvt_flr_i32_f32",
+            (Format::Vop1, vop1::V_FREXP_EXP_I32_F32) => "v_frexp_exp_i32_f32",
+            (Format::Vop1, vop1::V_FREXP_MANT_F32) => "v_frexp_mant_f32",
             (Format::Vop1, vop1::V_CVT_I32_F64) => "v_cvt_i32_f64",
             (Format::Vop1, vop1::V_CVT_F64_I32) => "v_cvt_f64_i32",
             (Format::Vop1, vop1::V_CVT_F32_F64) => "v_cvt_f32_f64",
